@@ -1,0 +1,24 @@
+# 출력 Excel 파일 (자동 생성)
+정산결과_*.xlsx
+대사검토_*.xlsx
+정산_대사결과.xlsx
+정산보고서.xlsx
+매출_분석결과.xlsx
+
+# 로그
+settlement_log.txt
+*.log
+
+# 입력 원본 (민감 데이터)
+kt_raw.xlsx
+platform.xlsx
+매출.xlsx
+
+# Windows 시스템 파일
+desktop.ini
+Thumbs.db
+
+# Python 캐시
+__pycache__/
+*.pyc
+.env
