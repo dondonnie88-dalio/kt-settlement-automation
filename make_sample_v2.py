@@ -1,0 +1,275 @@
+"""
+make_sample_v2.py — run_settlement.py 테스트용 샘플 데이터 생성
+실제 KT/플랫폼 컬럼 구조 반영
+  KT     : 구매문서번호, 납품일자, 공급가액, 공급자명, 세금코드명, 이동유형명, 인수증
+  플랫폼 : 주문번호, 입고일, 정산금액, 협력사명, 매출과세구분, 서비스카테고리
+"""
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import datetime
+
+FONT = "Arial"
+HDR_COLOR = "1F4E79"
+
+def _bdr():
+    s = Side(style="thin", color="C0C0C0")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def write_table(ws, headers, rows, header_color=HDR_COLOR, col_widths=None):
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(1, c, h)
+        cell.font      = Font(name=FONT, bold=True, color="FFFFFF", size=10)
+        cell.fill      = PatternFill("solid", start_color=header_color)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border    = _bdr()
+    ws.row_dimensions[1].height = 20
+    for ri, row in enumerate(rows, 2):
+        fill = "F2F2F2" if ri % 2 == 0 else "FFFFFF"
+        for ci, val in enumerate(row, 1):
+            cell = ws.cell(ri, ci, val)
+            cell.font      = Font(name=FONT, size=10)
+            cell.fill      = PatternFill("solid", start_color=fill)
+            cell.border    = _bdr()
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and abs(val) >= 1000:
+                cell.number_format = "#,##0"
+    if col_widths:
+        for i, w in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+
+def d(day): return datetime.date(2025, 5, day)
+
+# ══════════════════════════════════════════════════════
+# 1. mapping_master.xlsx
+# ══════════════════════════════════════════════════════
+wb_mm = openpyxl.Workbook()
+
+ws1 = wb_mm.active; ws1.title = "서비스카테고리"
+write_table(ws1,
+    ["서비스카테고리", "관리회계", "담당자"],
+    [
+        ("출판/인쇄",   "출판/인쇄",   "정도원"),
+        ("IT서비스",    "IT서비스",    "김철수"),
+        ("통신장비",    "통신장비",    "이영희"),
+        ("소프트웨어",  "소프트웨어",  "박민준"),
+        ("유지보수",    "유지보수",    "최수진"),
+    ],
+    col_widths=[18, 16, 12]
+)
+
+ws2 = wb_mm.create_sheet("일반통신구분")
+write_table(ws2,
+    ["담당자", "일반/통신구분"],
+    [
+        ("정도원", "일반"), ("김철수", "일반"), ("박민준", "일반"),
+        ("이영희", "통신"), ("최수진", "통신"),
+    ],
+    col_widths=[14, 16]
+)
+
+ws3 = wb_mm.create_sheet("기업규모")
+write_table(ws3,
+    ["협력사명", "기업규모"],
+    [
+        ("삼성SDS",           "대기업"),
+        ("한국IT솔루션(주)",  "중견기업"),
+        ("우리문구(주)",      "중소기업"),
+        ("케이네트웍스(주)",  "중소기업"),
+        ("비즈솔루션(주)",    "중소기업"),
+        ("에코서비스(주)",    "중소기업"),
+    ],
+    col_widths=[20, 14]
+)
+wb_mm.save("mapping_master.xlsx")
+print("[OK] mapping_master.xlsx 생성")
+
+# ══════════════════════════════════════════════════════
+# 2. KT raw 데이터 (실제 KT 컬럼 구조)
+#    구매문서번호, 납품일자, 공급자명, 세금코드명, 이동유형명, 인수증,
+#    공급가액, 세액, 합계금액, 사업장
+# ══════════════════════════════════════════════════════
+
+# 세금코드명: 실제 KT 파일 방식  (과세표준세율/면세/비과세 등 자유형식)
+TAX_CODE = {"과세": "과세표준세율(10%)", "면세": "면세(별도세액없음)", "비과세": "비과세"}
+
+KT_HEADERS = [
+    "입고전표", "구매문서번호", "납품일자", "공급자명",
+    "세금코드명", "이동유형명", "인수증",
+    "공급가액", "세액", "합계금액", "사업장",
+]
+
+def kt_row(doc_no, day, corp, tax_key, move, req_no, supply_amt, biz="본사"):
+    tax_code = TAX_CODE[tax_key]
+    vat = supply_amt * 0.1 if tax_key == "과세" else 0
+    total = supply_amt + int(vat)
+    return (
+        f"EL{doc_no}",   # 입고전표
+        doc_no,           # 구매문서번호 (= 플랫폼 주문번호 매칭 키)
+        d(day),           # 납품일자
+        corp,             # 공급자명
+        tax_code,         # 세금코드명  → _preprocess_kt()가 정규화
+        move,             # 이동유형명: '입고' or '반품'
+        req_no,           # 인수증
+        supply_amt,       # 공급가액
+        int(vat),         # 세액
+        total,            # 합계금액
+        biz,              # 사업장
+    )
+
+kt_rows = []
+
+# ─ A. 정상 일치 15건 ─
+normal_data = [
+    ("ORD-2025-001","REQ-001", 1,"우리문구(주)",    "과세",   500_000),
+    ("ORD-2025-002","REQ-002", 1,"우리문구(주)",    "과세",   150_000),
+    ("ORD-2025-003","REQ-003", 2,"우리문구(주)",    "과세",   500_000),
+    ("ORD-2025-004","REQ-004", 2,"한국IT솔루션(주)","과세", 1_200_000),
+    ("ORD-2025-005","REQ-005", 3,"한국IT솔루션(주)","면세",   850_000),
+    ("ORD-2025-006","REQ-006", 5,"케이네트웍스(주)","과세", 7_000_000),
+    ("ORD-2025-007","REQ-007", 6,"케이네트웍스(주)","과세", 5_200_000),
+    ("ORD-2025-008","REQ-008", 7,"비즈솔루션(주)",  "과세", 8_900_000),
+    ("ORD-2025-009","REQ-009", 8,"비즈솔루션(주)",  "과세", 6_300_000),
+    ("ORD-2025-010","REQ-010", 9,"에코서비스(주)",  "면세",   350_000),
+    ("ORD-2025-011","REQ-011",10,"에코서비스(주)",  "면세",   840_000),
+    ("ORD-2025-012","REQ-012",12,"우리문구(주)",    "과세",    80_000),
+    ("ORD-2025-013","REQ-013",13,"한국IT솔루션(주)","과세", 2_500_000),
+    ("ORD-2025-014","REQ-014",14,"케이네트웍스(주)","과세", 3_400_000),
+    ("ORD-2025-015","REQ-015",15,"비즈솔루션(주)",  "과세", 4_500_000),
+]
+for doc, req, day, corp, tax, amt in normal_data:
+    kt_rows.append(kt_row(doc, day, corp, tax, "입고", req, amt))
+
+# ─ B. 플랫폼 누락 3건 ─
+missing_data = [
+    ("ORD-2025-016","REQ-016", 4,"우리문구(주)",    "과세",   225_000),
+    ("ORD-2025-017","REQ-017", 8,"한국IT솔루션(주)","과세",   380_000),
+    ("ORD-2025-018","REQ-018",11,"에코서비스(주)",  "면세",   150_000),
+]
+for doc, req, day, corp, tax, amt in missing_data:
+    kt_rows.append(kt_row(doc, day, corp, tax, "입고", req, amt))
+
+# ─ C. 반품 2건 (이동유형명='반품', 별도 구매문서번호) ─
+return_data = [
+    ("RTN-2025-001","REQ-019", 6,"케이네트웍스(주)","과세",-3_500_000),
+    ("RTN-2025-002","REQ-020",13,"에코서비스(주)",  "면세",  -420_000),
+]
+for doc, req, day, corp, tax, amt in return_data:
+    kt_rows.append(kt_row(doc, day, corp, tax, "반품", req, amt))
+
+# ─ D. 금액 불일치 5건 (KT = 플랫폼 + 500) ─
+amtdiff_data = [
+    ("ORD-2025-019","REQ-021", 3,"비즈솔루션(주)",  "과세", 1_750_500),
+    ("ORD-2025-020","REQ-022", 5,"한국IT솔루션(주)","과세", 2_300_500),
+    ("ORD-2025-021","REQ-023", 9,"케이네트웍스(주)","과세", 3_100_500),
+    ("ORD-2025-022","REQ-024",12,"우리문구(주)",    "과세",   980_500),
+    ("ORD-2025-023","REQ-025",14,"비즈솔루션(주)",  "과세", 4_500_500),
+]
+for doc, req, day, corp, tax, amt in amtdiff_data:
+    kt_rows.append(kt_row(doc, day, corp, tax, "입고", req, amt))
+
+# ─ E. 비과세 대기업 1건 (삼성SDS, 2.1억) ─
+kt_rows.append(kt_row("ORD-2025-024", 10, "삼성SDS", "비과세", "입고", "REQ-026", 210_000_000))
+
+# 합계 행 추가 (입고전표 공란 → _preprocess_kt()가 제거해야 함)
+total_supply = sum(r[7] for r in kt_rows)
+kt_rows.append((
+    "",          # 입고전표 공란 → 합계 행 식별
+    "합계",      # 구매문서번호
+    "",          # 납품일자
+    "",          # 공급자명
+    "",          # 세금코드명
+    "",          # 이동유형명
+    "",          # 인수증
+    total_supply,# 공급가액 합계
+    "",          # 세액
+    "",          # 합계금액
+    "",          # 사업장
+))
+
+wb_kt = openpyxl.Workbook()
+ws_kt = wb_kt.active; ws_kt.title = "KT_입고내역"
+write_table(ws_kt, KT_HEADERS, kt_rows,
+            col_widths=[14,18,13,20,22,12,14,16,12,16,8])
+wb_kt.save("kt_raw.xlsx")
+print(f"[OK] kt_raw.xlsx 생성 ({len(kt_rows)-1}건 + 합계행 1건)")
+
+# ══════════════════════════════════════════════════════
+# 3. platform.xlsx (실제 플랫폼 컬럼 구조)
+#    주문번호, 입고일, 협력사명, 매출과세구분, 정산금액, 서비스카테고리
+#    ※ 요청번호 컬럼 없음 → 반품은 경로 B (return_mapping.xlsx)
+# ══════════════════════════════════════════════════════
+
+# 서비스카테고리 매핑 (실제 파일에서는 플랫폼이 갖고 있음)
+SVC_MAP = {
+    "우리문구(주)"    : "출판/인쇄",
+    "한국IT솔루션(주)": "IT서비스",
+    "케이네트웍스(주)": "통신장비",
+    "비즈솔루션(주)"  : "소프트웨어",
+    "에코서비스(주)"  : "유지보수",
+    "삼성SDS"         : "IT서비스",
+}
+
+PL_HEADERS = ["주문번호", "입고일", "협력사명", "매출과세구분", "정산금액", "서비스카테고리"]
+
+pl_rows = []
+
+# 정상 15건 (플랫폼 금액 = KT 금액)
+for doc, req, day, corp, tax, amt in normal_data:
+    pl_rows.append((doc, d(day), corp, tax, amt, SVC_MAP.get(corp, "")))
+
+# 금액 불일치 5건 (플랫폼 금액 = KT - 500)
+for doc, req, day, corp, tax, amt in amtdiff_data:
+    pl_rows.append((doc, d(day), corp, tax, amt - 500, SVC_MAP.get(corp, "")))
+
+# 반품 원주문 2건 (플랫폼 내 별도 주문번호로 존재)
+pl_rows.append(("ORD-ORIG-019", d(5), "케이네트웍스(주)", "과세", -3_500_000, "통신장비"))
+pl_rows.append(("ORD-ORIG-020", d(11),"에코서비스(주)",   "면세",   -420_000, "유지보수"))
+
+# 대기업 비과세 1건
+pl_rows.append(("ORD-2025-024", d(10),"삼성SDS","비과세", 210_000_000, "IT서비스"))
+
+wb_pl = openpyxl.Workbook()
+ws_pl = wb_pl.active; ws_pl.title = "플랫폼_입고내역"
+write_table(ws_pl, PL_HEADERS, pl_rows,
+            col_widths=[18,13,20,14,16,14])
+wb_pl.save("platform.xlsx")
+print(f"[OK] platform.xlsx 생성 ({len(pl_rows)}건, 요청번호 컬럼 없음 → 경로 B)")
+
+# ══════════════════════════════════════════════════════
+# 4. return_mapping.xlsx (반품 매핑 수동입력 완료 상태)
+# ══════════════════════════════════════════════════════
+RM_HEADERS = ["KT반품주문번호","KT요청번호","플랫폼원주문번호","협력사명","정산금액","처리상태"]
+rm_rows = [
+    ("RTN-2025-001","REQ-019","ORD-ORIG-019","케이네트웍스(주)",-3_500_000,"완료"),
+    ("RTN-2025-002","REQ-020","ORD-ORIG-020","에코서비스(주)",    -420_000,"완료"),
+]
+wb_rm = openpyxl.Workbook()
+ws_rm = wb_rm.active; ws_rm.title = "반품매핑"
+write_table(ws_rm, RM_HEADERS, rm_rows, col_widths=[18,14,18,18,14,10])
+wb_rm.save("return_mapping.xlsx")
+print("[OK] return_mapping.xlsx 생성 (플랫폼원주문번호 입력 완료)")
+
+# ══════════════════════════════════════════════════════
+# 요약
+# ══════════════════════════════════════════════════════
+print(f"""
+[샘플 데이터 요약]
+  kt_raw.xlsx       : {len(kt_rows)-1}건 (+ 합계 행 1건 — _preprocess_kt() 가 자동 제거)
+    - 정상 일치     : 15건  (ORD-2025-001 ~ 015)
+    - 플랫폼 누락   :  3건  (ORD-2025-016 ~ 018)
+    - 반품           :  2건  (RTN-2025-001 ~ 002,  이동유형명='반품')
+    - 금액 불일치   :  5건  (ORD-2025-019 ~ 023,  KT+500)
+    - 대기업/비과세 :  1건  (ORD-2025-024, 삼성SDS 2.1억)
+  KT 컬럼: 구매문서번호, 납품일자, 공급자명, 세금코드명, 이동유형명, 인수증, 공급가액
+
+  platform.xlsx     : {len(pl_rows)}건 (요청번호 없음 → 경로 B)
+    - 정상 15건 + 금액차이 5건 + 반품원주문 2건 + 대기업 1건
+    - 누락 3건 미포함
+  플랫폼 컬럼: 주문번호, 입고일, 협력사명, 매출과세구분, 정산금액, 서비스카테고리
+
+  매칭 키: KT 구매문서번호 ↔ 플랫폼 주문번호
+  mapping_master.xlsx: 서비스카테고리 5건 / 일반통신구분 5건 / 기업규모 6건
+  return_mapping.xlsx : 반품 2건 (플랫폼원주문번호 입력 완료)
+""")
