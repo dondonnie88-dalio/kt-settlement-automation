@@ -44,6 +44,7 @@ ROW_TOTAL    = "D9D9D9"   # 합계 행 배경
 # KT 핵심 컬럼 후보 목록  (실제 KT raw 파일 기준)
 _KT_CANDIDATES = {
     "주문번호"    : ["구매문서번호"],                          # KT 구매문서번호
+    "구매품목"    : ["구매품목"],                              # 라인 아이템 번호 (복합 키 후반부)
     "요청번호"    : ["인수증"],                                # KT 인수증 (플랫폼 요청번호 대응)
     "입고일"      : ["납품일자"],                              # KT 납품일자
     "정산금액"    : ["공급가액"],                              # KT 공급가액 (세전)
@@ -57,6 +58,7 @@ _KT_CANDIDATES = {
 # 플랫폼 핵심 컬럼 후보 목록  (플랫폼이 인보이스 기준)
 _PL_CANDIDATES = {
     "주문번호"      : ["주문번호"],
+    "품목번호"      : ["품목번호"],                            # 라인 아이템 번호 (복합 키 후반부)
     "입고일"        : ["입고일"],
     "정산금액"      : ["정산금액"],
     "협력사명"      : ["협력사명"],
@@ -122,7 +124,8 @@ def detect_col(df: pd.DataFrame, candidates: List[str],
 
 def build_col_map(df: pd.DataFrame, spec: dict) -> Dict[str, Optional[str]]:
     result = {}
-    _optional = {"관리회계", "담당자", "일반통신구분", "서비스카테고리", "요청번호"}
+    _optional = {"관리회계", "담당자", "일반통신구분", "서비스카테고리", "요청번호",
+                 "구매품목", "품목번호"}
     for key, cands in spec.items():
         result[key] = detect_col(df, cands, required=(key not in _optional))
     return result
@@ -274,8 +277,9 @@ class SettlementRunner:
         self.df_ret_ok  = None   # 반품 매칭 성공
         self.df_ret_ng  = None   # 반품 미확인
         self.ret_route  = None   # 'A' or 'B'
-        self.df_invoice = None
-        self.map_stats  = {}
+        self.df_invoice    = None
+        self.map_stats     = {}
+        self.composite_key = False   # True = 주문번호+품목번호 복합 키 사용
 
     def _setup_logger(self):
         log = logging.getLogger("settlement")
@@ -348,7 +352,14 @@ class SettlementRunner:
             print(f"  {mark} {key:<14} → {found or '(없음)'}")
 
         req_col = self.pl_cols.get("요청번호")
-        print(f"\n▶ 반품 처리 경로: {'A (요청번호 직접 매칭)' if req_col else 'B (return_mapping.xlsx 사용)'}")
+        kt_item = self.kt_cols.get("구매품목")
+        pl_item = self.pl_cols.get("품목번호")
+        key_mode = (f"복합 키  ({self.kt_cols['주문번호']}+{kt_item}  ↔  "
+                    f"{self.pl_cols['주문번호']}+{pl_item})"
+                    if kt_item and pl_item else
+                    f"단순 키  ({self.kt_cols['주문번호']} ↔ {self.pl_cols['주문번호']})")
+        print(f"\n▶ 매칭 키 모드  : {key_mode}")
+        print(f"▶ 반품 처리 경로: {'A (요청번호 직접 매칭)' if req_col else 'B (return_mapping.xlsx 사용)'}")
         print(LINE)
 
         ans = input("위 설정으로 진행하시겠습니까? (Y/n): ").strip().lower()
@@ -394,6 +405,46 @@ class SettlementRunner:
             self.log.info(f"  세금코드명 정규화 완료 (→ 과세/면세/비과세)")
         return df
 
+    # ── 복합 키 생성 ────────────────────────────────────────────
+    @staticmethod
+    def _item_str(series: pd.Series) -> pd.Series:
+        """품목번호를 정수 문자열로 정규화: 10.0 → '10', '010' → '10', '' → ''"""
+        def _conv(v):
+            s = str(v).strip()
+            if s in ("", "nan", "None"): return ""
+            try:
+                return str(int(float(s)))
+            except (ValueError, TypeError):
+                return s
+        return series.apply(_conv)
+
+    def _assign_match_keys(self):
+        """KT와 플랫폼 DataFrame에 _match_key 컬럼 부여.
+        구매문서번호+구매품목 ↔ 주문번호+품목번호 (구분자 없이 연결)
+        품목번호 컬럼이 없으면 주문번호만 사용(단순 키 폴백).
+        """
+        kt_ord  = self.kt_cols["주문번호"]
+        pl_ord  = self.pl_cols["주문번호"]
+        kt_item = self.kt_cols.get("구매품목")
+        pl_item = self.pl_cols.get("품목번호")
+
+        if kt_item and pl_item and kt_item in self.df_kt.columns and pl_item in self.df_pl.columns:
+            self.composite_key = True
+            self.df_kt["_match_key"] = (
+                self.df_kt[kt_ord].fillna("").astype(str)
+                + self._item_str(self.df_kt[kt_item])
+            )
+            self.df_pl["_match_key"] = (
+                self.df_pl[pl_ord].fillna("").astype(str)
+                + self._item_str(self.df_pl[pl_item])
+            )
+            self.log.info(f"  복합 키 생성: {kt_ord}+{kt_item} ↔ {pl_ord}+{pl_item}")
+        else:
+            self.composite_key = False
+            self.df_kt["_match_key"] = self.df_kt[kt_ord].fillna("").astype(str)
+            self.df_pl["_match_key"] = self.df_pl[pl_ord].fillna("").astype(str)
+            self.log.info(f"  단순 키 사용: {kt_ord} ↔ {pl_ord}")
+
     # ── STEP 1: 기간 필터 ──────────────────────────────────────
     def step1_filter(self):
         self.log.info("\n[STEP 1] 정산 기간 필터링")
@@ -420,6 +471,8 @@ class SettlementRunner:
         self.df_kt = df_kt[(df_kt[dc_kt] >= self.ps) & (df_kt[dc_kt] <= self.pe)].copy().reset_index(drop=True)
         self.df_pl = df_pl[(df_pl[dc_pl] >= self.ps) & (df_pl[dc_pl] <= self.pe)].copy().reset_index(drop=True)
         self.log.info(f"  KT 기간 내: {len(self.df_kt)}건 / 플랫폼 기간 내: {len(self.df_pl)}건")
+        # 복합 키 생성 (구매문서번호+구매품목 ↔ 주문번호+품목번호)
+        self._assign_match_keys()
 
     # ── STEP 2: 반품 선분리 ────────────────────────────────────
     def step2_separate_returns(self):
@@ -439,41 +492,41 @@ class SettlementRunner:
 
     # ── STEP 3: 일반 주문 대사 ─────────────────────────────────
     def step3_reconcile_normal(self):
-        self.log.info("\n[STEP 3] 일반 주문 대사 (주문번호 기준)")
-        ord_kt = self.kt_cols["주문번호"]
-        ord_pl = self.pl_cols["주문번호"]
+        key_label = "복합 키" if self.composite_key else "주문번호"
+        self.log.info(f"\n[STEP 3] 일반 주문 대사 ({key_label} 기준)")
         amt_kt = self.kt_cols["정산금액"]
         amt_pl = self.pl_cols["정산금액"]
 
-        kt_set = set(self.df_normal[ord_kt])
-        pl_set = set(self.df_pl[ord_pl])
+        # _match_key 기반 집합 비교
+        kt_set = set(self.df_normal["_match_key"])
+        pl_set = set(self.df_pl["_match_key"])
 
         matched = kt_set & pl_set
         kt_only = kt_set - pl_set
         pl_only = pl_set - kt_set
 
         # A: 일치 + 금액 비교
-        df_m = self.df_normal[self.df_normal[ord_kt].isin(matched)].copy()
-        pl_amt_map = self.df_pl.set_index(ord_pl)[amt_pl].apply(
-            pd.to_numeric, errors="coerce"
-        ).to_dict()
+        df_m = self.df_normal[self.df_normal["_match_key"].isin(matched)].copy()
+        pl_amt_map = (self.df_pl.set_index("_match_key")[amt_pl]
+                      .apply(pd.to_numeric, errors="coerce")
+                      .to_dict())
         df_m["_amt_kt"] = pd.to_numeric(df_m[amt_kt], errors="coerce")
-        df_m["플랫폼정산금액"] = df_m[ord_kt].map(pl_amt_map)
+        df_m["플랫폼정산금액"] = df_m["_match_key"].map(pl_amt_map)
         df_m["금액차이"] = df_m["_amt_kt"] - df_m["플랫폼정산금액"]
         df_m["플랫폼대사결과"] = "정상"
         df_m.drop(columns=["_amt_kt"], inplace=True)
 
         self.df_matched  = df_m
         self.df_amtdiff  = df_m[df_m["금액차이"].abs() > 1].copy()
-        self.df_missing  = self.df_normal[self.df_normal[ord_kt].isin(kt_only)].copy()
-        self.df_pl_only  = self.df_pl[self.df_pl[ord_pl].isin(pl_only)].copy()
+        self.df_missing  = self.df_normal[self.df_normal["_match_key"].isin(kt_only)].copy()
+        self.df_pl_only  = self.df_pl[self.df_pl["_match_key"].isin(pl_only)].copy()
 
         self.log.info(f"  [A] 일치        : {len(matched)}건")
         self.log.info(f"  [B] 플랫폼 누락 : {len(kt_only)}건  ← KT에만 존재")
         self.log.info(f"  [C] KT 미포함   : {len(pl_only)}건  ← 플랫폼에만 존재")
         self.log.info(f"  금액 불일치     : {len(self.df_amtdiff)}건  (±1원 초과)")
         if kt_only:
-            self.log.info(f"  누락 주문번호   : {sorted(kt_only)}")
+            self.log.info(f"  누락 복합키     : {sorted(kt_only)}")
 
     # ── STEP 4: 반품 대사 ──────────────────────────────────────
     def step4_reconcile_returns(self):
@@ -529,58 +582,72 @@ class SettlementRunner:
 
         if not self.rm_path or not self.rm_path.exists():
             # ① 파일 없음 → 생성 후 종료
+            kt_item_col = self.kt_cols.get("구매품목")
             rows = []
             for _, r in self.df_ret_kt.iterrows():
                 rows.append({
-                    "KT반품주문번호"    : r.get(ord_col, ""),
-                    "KT요청번호"        : r.get(req_col, "") if req_col else "",
-                    "플랫폼원주문번호"  : "",  # 사용자 수동 입력
-                    "협력사명"          : r.get(corp_col, "") if corp_col else "",
-                    "정산금액"          : r.get(amt_col, ""),
-                    "처리상태"          : "미입력",
+                    "KT반품복합키"   : r.get("_match_key", r.get(ord_col, "")),
+                    "KT반품주문번호" : r.get(ord_col, ""),
+                    "KT구매품목"     : (r.get(kt_item_col, "") if kt_item_col else ""),
+                    "KT요청번호"     : (r.get(req_col, "") if req_col else ""),
+                    "플랫폼원복합키" : "",  # 사용자 입력: 플랫폼 주문번호+품목번호 연결
+                    "협력사명"       : (r.get(corp_col, "") if corp_col else ""),
+                    "정산금액"       : r.get(amt_col, ""),
+                    "처리상태"       : "미입력",
                 })
             rm_df = pd.DataFrame(rows)
             rm_df.to_excel("return_mapping.xlsx", index=False)
             n = len(rows)
+            key_hint = ("복합 키(주문번호+품목번호)" if self.composite_key
+                        else "주문번호")
             print(f"""
-{"="*55}
+{"="*60}
   반품 {n}건의 매핑 파일이 생성됐습니다: return_mapping.xlsx
 
   1. return_mapping.xlsx 열기
-  2. 각 행의 KT요청번호를 통합플랫폼에서 검색
-  3. 조회된 주문번호를 C열(플랫폼원주문번호)에 입력
+  2. 각 행의 KT요청번호로 통합플랫폼에서 대응 건 검색
+  3. 플랫폼 '{key_hint}'를 E열(플랫폼원복합키)에 입력
+     예) 주문번호 'ORD-001' + 품목번호 '10' → 'ORD-00110'
   4. python run_settlement.py 재실행
 
-  ※ 전산팀에 플랫폼 파일 요청번호 컬럼 추가 요청 시
+  ※ 전산팀에 플랫폼 요청번호 컬럼 추가 요청 시
     완전 자동화(경로 A) 가능
-{"="*55}""")
+{"="*60}""")
             sys.exit(0)
 
-        # ② 파일 있음 → 플랫폼원주문번호 입력된 행만 매칭
+        # ② 파일 있음 → 매칭 실행
         rm = pd.read_excel(self.rm_path, dtype=str, engine="openpyxl").fillna("")
-        pl_ord_col = self.pl_cols["주문번호"]
         pl_amt_col = self.pl_cols["정산금액"]
-        pl_amt_map = self.df_pl.set_index(pl_ord_col)[pl_amt_col].apply(
-            pd.to_numeric, errors="coerce"
-        ).to_dict()
+        # 플랫폼 금액 룩업: _match_key 기반
+        pl_amt_map = (self.df_pl.set_index("_match_key")[pl_amt_col]
+                      .apply(pd.to_numeric, errors="coerce")
+                      .to_dict())
 
         ok_list, ng_list = [], []
         for _, ret_row in self.df_ret_kt.iterrows():
-            ret_ord = str(ret_row.get(ord_col, "")).strip()
-            # return_mapping에서 이 반품 주문 찾기
-            rm_row = rm[rm["KT반품주문번호"].str.strip() == ret_ord]
+            kt_key = str(ret_row.get("_match_key", "")).strip()
+            # return_mapping에서 이 반품 건 찾기 (KT반품복합키 컬럼 우선, 없으면 KT반품주문번호)
+            if "KT반품복합키" in rm.columns:
+                rm_row = rm[rm["KT반품복합키"].str.strip() == kt_key]
+            else:
+                rm_row = rm[rm["KT반품주문번호"].str.strip() == str(ret_row.get(ord_col, "")).strip()]
             if rm_row.empty:
                 ng_list.append({**ret_row, "플랫폼대사결과": "미확인",
                                  "플랫폼정산금액": None, "금액차이": None})
                 continue
 
-            pl_ord = str(rm_row.iloc[0].get("플랫폼원주문번호", "")).strip()
-            if not pl_ord:
+            # 플랫폼원복합키 (신규) 또는 플랫폼원주문번호 (구버전) 읽기
+            if "플랫폼원복합키" in rm_row.columns:
+                pl_key = str(rm_row.iloc[0].get("플랫폼원복합키", "")).strip()
+            else:
+                pl_key = str(rm_row.iloc[0].get("플랫폼원주문번호", "")).strip()
+
+            if not pl_key:
                 ng_list.append({**ret_row, "플랫폼대사결과": "미확인",
                                  "플랫폼정산금액": None, "금액차이": None})
                 continue
 
-            pl_amt = pl_amt_map.get(pl_ord)
+            pl_amt = pl_amt_map.get(pl_key)
             kt_amt = pd.to_numeric(ret_row.get(amt_col), errors="coerce")
             ok_list.append({**ret_row,
                              "플랫폼대사결과" : "반품",
@@ -604,21 +671,21 @@ class SettlementRunner:
         df["KT공급가액"] = pd.NA
         df["금액차이"]   = pd.NA
 
-        # KT 금액 룩업 (구매문서번호 → 공급가액)
+        # KT 금액 룩업 (_match_key → 공급가액)
         kt_amt_map = (
-            self.df_kt.dropna(subset=[kt_ord_col])
-            .set_index(kt_ord_col)[kt_amt_col]
+            self.df_kt[self.df_kt["_match_key"] != ""]
+            .set_index("_match_key")[kt_amt_col]
             .apply(pd.to_numeric, errors="coerce")
             .to_dict()
         )
-        df["KT공급가액"] = df[pl_ord_col].map(kt_amt_map)
+        df["KT공급가액"] = df["_match_key"].map(kt_amt_map)
         df[pl_amt_col]   = pd.to_numeric(df[pl_amt_col], errors="coerce")
         df["금액차이"]   = df[pl_amt_col] - df["KT공급가액"]
 
         # KT 미포함 (플랫폼에만 있는 주문)
         if self.df_pl_only is not None and len(self.df_pl_only) > 0:
-            pl_only_set = set(self.df_pl_only[pl_ord_col])
-            m = df[pl_ord_col].isin(pl_only_set)
+            pl_only_set = set(self.df_pl_only["_match_key"])
+            m = df["_match_key"].isin(pl_only_set)
             df.loc[m, "대사결과"]   = "KT미포함"
             df.loc[m, ["KT공급가액", "금액차이"]] = pd.NA
 
@@ -629,8 +696,11 @@ class SettlementRunner:
         # 반품 표시 — 경로 B (return_mapping.xlsx)
         if self.ret_route == "B" and self.rm_path and self.rm_path.exists():
             rm = pd.read_excel(self.rm_path, dtype=str, engine="openpyxl").fillna("")
-            pl_from_rm = set(rm["플랫폼원주문번호"].str.strip()) - {""}
-            df.loc[df[pl_ord_col].isin(pl_from_rm), "대사결과"] = "반품"
+            # 신규 형식(플랫폼원복합키) 또는 구버전(플랫폼원주문번호) 대응
+            pl_key_col = ("플랫폼원복합키" if "플랫폼원복합키" in rm.columns
+                          else "플랫폼원주문번호")
+            pl_from_rm = set(rm[pl_key_col].str.strip()) - {""}
+            df.loc[df["_match_key"].isin(pl_from_rm), "대사결과"] = "반품"
 
         # 반품 표시 — 경로 A (요청번호 매칭)
         pl_req_col = self.pl_cols.get("요청번호")
@@ -661,6 +731,10 @@ class SettlementRunner:
             # pl_cols 에 서비스카테고리, kt_cols 에 타겟 컬럼명
             merged_cols = {**self.pl_cols, **self.kt_cols}
             df, self.map_stats = self.master.apply(df, merged_cols, self.log)
+
+        # 내부 작업 컬럼 제거 (Excel 출력 제외)
+        drop_cols = [c for c in df.columns if str(c).startswith("_")]
+        df = df.drop(columns=drop_cols, errors="ignore")
 
         self.df_invoice = df
         return df

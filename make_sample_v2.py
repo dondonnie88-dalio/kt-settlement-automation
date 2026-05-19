@@ -95,18 +95,20 @@ print("[OK] mapping_master.xlsx 생성")
 TAX_CODE = {"과세": "과세표준세율(10%)", "면세": "면세(별도세액없음)", "비과세": "비과세"}
 
 KT_HEADERS = [
-    "입고전표", "구매문서번호", "납품일자", "공급자명",
+    "입고전표", "구매문서번호", "구매품목",     # 구매품목 = 라인 아이템 번호
+    "납품일자", "공급자명",
     "세금코드명", "이동유형명", "인수증",
     "공급가액", "세액", "합계금액", "사업장",
 ]
 
-def kt_row(doc_no, day, corp, tax_key, move, req_no, supply_amt, biz="본사"):
+def kt_row(doc_no, item_no, day, corp, tax_key, move, req_no, supply_amt, biz="본사"):
     tax_code = TAX_CODE[tax_key]
     vat = supply_amt * 0.1 if tax_key == "과세" else 0
     total = supply_amt + int(vat)
     return (
         f"EL{doc_no}",   # 입고전표
-        doc_no,           # 구매문서번호 (= 플랫폼 주문번호 매칭 키)
+        doc_no,           # 구매문서번호
+        item_no,          # 구매품목  (복합 키 후반부)
         d(day),           # 납품일자
         corp,             # 공급자명
         tax_code,         # 세금코드명  → _preprocess_kt()가 정규화
@@ -121,77 +123,82 @@ def kt_row(doc_no, day, corp, tax_key, move, req_no, supply_amt, biz="본사"):
 kt_rows = []
 
 # ─ A. 정상 일치 15건 ─
+# (주문번호, 구매품목, 요청번호, 입고일, 협력사, 과세, 금액)
+# 복합 키: 주문번호+구매품목  ↔  주문번호+품목번호
 normal_data = [
-    ("ORD-2025-001","REQ-001", 1,"우리문구(주)",    "과세",   500_000),
-    ("ORD-2025-002","REQ-002", 1,"우리문구(주)",    "과세",   150_000),
-    ("ORD-2025-003","REQ-003", 2,"우리문구(주)",    "과세",   500_000),
-    ("ORD-2025-004","REQ-004", 2,"한국IT솔루션(주)","과세", 1_200_000),
-    ("ORD-2025-005","REQ-005", 3,"한국IT솔루션(주)","면세",   850_000),
-    ("ORD-2025-006","REQ-006", 5,"케이네트웍스(주)","과세", 7_000_000),
-    ("ORD-2025-007","REQ-007", 6,"케이네트웍스(주)","과세", 5_200_000),
-    ("ORD-2025-008","REQ-008", 7,"비즈솔루션(주)",  "과세", 8_900_000),
-    ("ORD-2025-009","REQ-009", 8,"비즈솔루션(주)",  "과세", 6_300_000),
-    ("ORD-2025-010","REQ-010", 9,"에코서비스(주)",  "면세",   350_000),
-    ("ORD-2025-011","REQ-011",10,"에코서비스(주)",  "면세",   840_000),
-    ("ORD-2025-012","REQ-012",12,"우리문구(주)",    "과세",    80_000),
-    ("ORD-2025-013","REQ-013",13,"한국IT솔루션(주)","과세", 2_500_000),
-    ("ORD-2025-014","REQ-014",14,"케이네트웍스(주)","과세", 3_400_000),
-    ("ORD-2025-015","REQ-015",15,"비즈솔루션(주)",  "과세", 4_500_000),
+    # 주문번호 ORD-2025-001 에 2개 라인 (10, 20)
+    ("ORD-2025-001","10","REQ-001", 1,"우리문구(주)",    "과세",   300_000),
+    ("ORD-2025-001","20","REQ-001", 1,"우리문구(주)",    "과세",   200_000),
+    # 이하 주문번호당 1개 라인 (10)
+    ("ORD-2025-002","10","REQ-002", 1,"우리문구(주)",    "과세",   150_000),
+    ("ORD-2025-003","10","REQ-003", 2,"우리문구(주)",    "과세",   500_000),
+    ("ORD-2025-004","10","REQ-004", 2,"한국IT솔루션(주)","과세", 1_200_000),
+    ("ORD-2025-005","10","REQ-005", 3,"한국IT솔루션(주)","면세",   850_000),
+    ("ORD-2025-006","10","REQ-006", 5,"케이네트웍스(주)","과세", 7_000_000),
+    ("ORD-2025-007","10","REQ-007", 6,"케이네트웍스(주)","과세", 5_200_000),
+    ("ORD-2025-008","10","REQ-008", 7,"비즈솔루션(주)",  "과세", 8_900_000),
+    ("ORD-2025-009","10","REQ-009", 8,"비즈솔루션(주)",  "과세", 6_300_000),
+    ("ORD-2025-010","10","REQ-010", 9,"에코서비스(주)",  "면세",   350_000),
+    ("ORD-2025-011","10","REQ-011",10,"에코서비스(주)",  "면세",   840_000),
+    ("ORD-2025-012","10","REQ-012",12,"우리문구(주)",    "과세",    80_000),
+    ("ORD-2025-013","10","REQ-013",13,"한국IT솔루션(주)","과세", 2_500_000),
+    ("ORD-2025-014","10","REQ-014",14,"케이네트웍스(주)","과세", 3_400_000),
 ]
-for doc, req, day, corp, tax, amt in normal_data:
-    kt_rows.append(kt_row(doc, day, corp, tax, "입고", req, amt))
+for doc, item, req, day, corp, tax, amt in normal_data:
+    kt_rows.append(kt_row(doc, item, day, corp, tax, "입고", req, amt))
 
 # ─ B. 플랫폼 누락 3건 ─
 missing_data = [
-    ("ORD-2025-016","REQ-016", 4,"우리문구(주)",    "과세",   225_000),
-    ("ORD-2025-017","REQ-017", 8,"한국IT솔루션(주)","과세",   380_000),
-    ("ORD-2025-018","REQ-018",11,"에코서비스(주)",  "면세",   150_000),
+    ("ORD-2025-015","10","REQ-015", 4,"우리문구(주)",    "과세",   225_000),
+    ("ORD-2025-016","10","REQ-016", 8,"한국IT솔루션(주)","과세",   380_000),
+    ("ORD-2025-017","10","REQ-017",11,"에코서비스(주)",  "면세",   150_000),
 ]
-for doc, req, day, corp, tax, amt in missing_data:
-    kt_rows.append(kt_row(doc, day, corp, tax, "입고", req, amt))
+for doc, item, req, day, corp, tax, amt in missing_data:
+    kt_rows.append(kt_row(doc, item, day, corp, tax, "입고", req, amt))
 
 # ─ C. 반품 2건 (이동유형명='반품', 별도 구매문서번호) ─
 return_data = [
-    ("RTN-2025-001","REQ-019", 6,"케이네트웍스(주)","과세",-3_500_000),
-    ("RTN-2025-002","REQ-020",13,"에코서비스(주)",  "면세",  -420_000),
+    ("RTN-2025-001","10","REQ-018", 6,"케이네트웍스(주)","과세",-3_500_000),
+    ("RTN-2025-002","10","REQ-019",13,"에코서비스(주)",  "면세",  -420_000),
 ]
-for doc, req, day, corp, tax, amt in return_data:
-    kt_rows.append(kt_row(doc, day, corp, tax, "반품", req, amt))
+for doc, item, req, day, corp, tax, amt in return_data:
+    kt_rows.append(kt_row(doc, item, day, corp, tax, "반품", req, amt))
 
 # ─ D. 금액 불일치 5건 (KT = 플랫폼 + 500) ─
 amtdiff_data = [
-    ("ORD-2025-019","REQ-021", 3,"비즈솔루션(주)",  "과세", 1_750_500),
-    ("ORD-2025-020","REQ-022", 5,"한국IT솔루션(주)","과세", 2_300_500),
-    ("ORD-2025-021","REQ-023", 9,"케이네트웍스(주)","과세", 3_100_500),
-    ("ORD-2025-022","REQ-024",12,"우리문구(주)",    "과세",   980_500),
-    ("ORD-2025-023","REQ-025",14,"비즈솔루션(주)",  "과세", 4_500_500),
+    ("ORD-2025-018","10","REQ-020", 3,"비즈솔루션(주)",  "과세", 1_750_500),
+    ("ORD-2025-019","10","REQ-021", 5,"한국IT솔루션(주)","과세", 2_300_500),
+    ("ORD-2025-020","10","REQ-022", 9,"케이네트웍스(주)","과세", 3_100_500),
+    ("ORD-2025-021","10","REQ-023",12,"우리문구(주)",    "과세",   980_500),
+    ("ORD-2025-022","10","REQ-024",14,"비즈솔루션(주)",  "과세", 4_500_500),
 ]
-for doc, req, day, corp, tax, amt in amtdiff_data:
-    kt_rows.append(kt_row(doc, day, corp, tax, "입고", req, amt))
+for doc, item, req, day, corp, tax, amt in amtdiff_data:
+    kt_rows.append(kt_row(doc, item, day, corp, tax, "입고", req, amt))
 
 # ─ E. 비과세 대기업 1건 (삼성SDS, 2.1억) ─
-kt_rows.append(kt_row("ORD-2025-024", 10, "삼성SDS", "비과세", "입고", "REQ-026", 210_000_000))
+kt_rows.append(kt_row("ORD-2025-023", "10", 10, "삼성SDS", "비과세", "입고", "REQ-025", 210_000_000))
 
-# 합계 행 추가 (입고전표 공란 → _preprocess_kt()가 제거해야 함)
-total_supply = sum(r[7] for r in kt_rows)
+# 합계 행 추가 (입고전표 공란 → _preprocess_kt()가 구매문서번호 공란으로 제거)
+total_supply = sum(r[8] for r in kt_rows)  # 공급가액은 인덱스 8
 kt_rows.append((
-    "",          # 입고전표 공란 → 합계 행 식별
-    "합계",      # 구매문서번호
-    "",          # 납품일자
-    "",          # 공급자명
-    "",          # 세금코드명
-    "",          # 이동유형명
-    "",          # 인수증
-    total_supply,# 공급가액 합계
-    "",          # 세액
-    "",          # 합계금액
-    "",          # 사업장
+    "",           # 입고전표 공란 → 합계 행 식별
+    "합계",       # 구매문서번호 (공란으로 두면 _preprocess_kt()가 제거)
+    "",           # 구매품목
+    "",           # 납품일자
+    "",           # 공급자명
+    "",           # 세금코드명
+    "",           # 이동유형명
+    "",           # 인수증
+    total_supply, # 공급가액 합계
+    "",           # 세액
+    "",           # 합계금액
+    "",           # 사업장
 ))
 
 wb_kt = openpyxl.Workbook()
 ws_kt = wb_kt.active; ws_kt.title = "KT_입고내역"
 write_table(ws_kt, KT_HEADERS, kt_rows,
-            col_widths=[14,18,13,20,22,12,14,16,12,16,8])
+            col_widths=[14,18,10,13,20,22,12,14,16,12,16,8])
 wb_kt.save("kt_raw.xlsx")
 print(f"[OK] kt_raw.xlsx 생성 ({len(kt_rows)-1}건 + 합계행 1건)")
 
@@ -211,39 +218,42 @@ SVC_MAP = {
     "삼성SDS"         : "IT서비스",
 }
 
-PL_HEADERS = ["주문번호", "입고일", "협력사명", "매출과세구분", "정산금액", "서비스카테고리"]
+PL_HEADERS = ["주문번호", "품목번호", "입고일", "협력사명", "매출과세구분", "정산금액", "서비스카테고리"]
 
 pl_rows = []
 
-# 정상 15건 (플랫폼 금액 = KT 금액)
-for doc, req, day, corp, tax, amt in normal_data:
-    pl_rows.append((doc, d(day), corp, tax, amt, SVC_MAP.get(corp, "")))
+# 정상 15건 (복합 키 = KT와 동일: 주문번호+품목번호)
+for doc, item, req, day, corp, tax, amt in normal_data:
+    pl_rows.append((doc, item, d(day), corp, tax, amt, SVC_MAP.get(corp, "")))
 
 # 금액 불일치 5건 (플랫폼 금액 = KT - 500)
-for doc, req, day, corp, tax, amt in amtdiff_data:
-    pl_rows.append((doc, d(day), corp, tax, amt - 500, SVC_MAP.get(corp, "")))
+for doc, item, req, day, corp, tax, amt in amtdiff_data:
+    pl_rows.append((doc, item, d(day), corp, tax, amt - 500, SVC_MAP.get(corp, "")))
 
-# 반품 원주문 2건 (플랫폼 내 별도 주문번호로 존재)
-pl_rows.append(("ORD-ORIG-019", d(5), "케이네트웍스(주)", "과세", -3_500_000, "통신장비"))
-pl_rows.append(("ORD-ORIG-020", d(11),"에코서비스(주)",   "면세",   -420_000, "유지보수"))
+# 반품 원주문 2건 (플랫폼 별도 주문번호, 품목번호 10)
+pl_rows.append(("ORD-ORIG-018","10", d(5), "케이네트웍스(주)", "과세", -3_500_000, "통신장비"))
+pl_rows.append(("ORD-ORIG-019","10", d(11),"에코서비스(주)",   "면세",   -420_000, "유지보수"))
 
 # 대기업 비과세 1건
-pl_rows.append(("ORD-2025-024", d(10),"삼성SDS","비과세", 210_000_000, "IT서비스"))
+pl_rows.append(("ORD-2025-023","10", d(10),"삼성SDS","비과세", 210_000_000, "IT서비스"))
 
 wb_pl = openpyxl.Workbook()
 ws_pl = wb_pl.active; ws_pl.title = "플랫폼_입고내역"
 write_table(ws_pl, PL_HEADERS, pl_rows,
-            col_widths=[18,13,20,14,16,14])
+            col_widths=[18,10,13,20,14,16,14])
 wb_pl.save("platform.xlsx")
 print(f"[OK] platform.xlsx 생성 ({len(pl_rows)}건, 요청번호 컬럼 없음 → 경로 B)")
 
 # ══════════════════════════════════════════════════════
 # 4. return_mapping.xlsx (반품 매핑 수동입력 완료 상태)
 # ══════════════════════════════════════════════════════
-RM_HEADERS = ["KT반품주문번호","KT요청번호","플랫폼원주문번호","협력사명","정산금액","처리상태"]
+RM_HEADERS = ["KT반품복합키","KT반품주문번호","KT구매품목","KT요청번호",
+              "플랫폼원복합키","협력사명","정산금액","처리상태"]
 rm_rows = [
-    ("RTN-2025-001","REQ-019","ORD-ORIG-019","케이네트웍스(주)",-3_500_000,"완료"),
-    ("RTN-2025-002","REQ-020","ORD-ORIG-020","에코서비스(주)",    -420_000,"완료"),
+    # KT반품복합키 = 구매문서번호+구매품목 (구분자 없이)
+    # 플랫폼원복합키 = 플랫폼주문번호+품목번호 (구분자 없이, 사용자가 직접 입력하는 컬럼)
+    ("RTN-2025-00110","RTN-2025-001","10","REQ-018","ORD-ORIG-01810","케이네트웍스(주)",-3_500_000,"완료"),
+    ("RTN-2025-00210","RTN-2025-002","10","REQ-019","ORD-ORIG-01910","에코서비스(주)",    -420_000,"완료"),
 ]
 wb_rm = openpyxl.Workbook()
 ws_rm = wb_rm.active; ws_rm.title = "반품매핑"
