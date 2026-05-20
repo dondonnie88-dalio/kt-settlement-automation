@@ -58,12 +58,19 @@ _KT_CANDIDATES = {
 # 플랫폼 핵심 컬럼 후보 목록  (플랫폼이 인보이스 기준)
 _PL_CANDIDATES = {
     "주문번호"      : ["주문번호"],
-    "품목번호"      : ["품목번호"],                            # 라인 아이템 번호 (복합 키 후반부)
+    "품목번호"      : ["품목번호"],                                  # 라인 아이템 번호
+    "주문품목키"    : ["주문&품목"],                                 # 플랫폼 사전계산 복합 키
     "입고일"        : ["입고일"],
     "정산금액"      : ["정산금액"],
+    "매입금액"      : ["매입금액"],
+    "매출총이익"    : ["매출총이익"],
     "협력사명"      : ["협력사명"],
     "매출과세구분"  : ["매출과세구분"],
-    "서비스카테고리": ["서비스카테고리"],   # XLOOKUP 소스 (플랫폼에 있음)
+    "서비스카테고리": ["서비스카테고리"],                            # XLOOKUP 소스
+    "중분류"        : ["중분류(IP만변경적용)", "중분류"],            # XLOOKUP 결과 (관리회계)
+    "담당자부서"    : ["담당자부서"],
+    "결제유형"      : ["결제유형"],
+    "이동유형"      : ["인보이스(KT이동유형명 값)", "이동유형"],
 }
 _PL_OPT = {"요청번호": ["요청번호"]}  # optional — 없으면 경로 B
 
@@ -125,7 +132,8 @@ def detect_col(df: pd.DataFrame, candidates: List[str],
 def build_col_map(df: pd.DataFrame, spec: dict) -> Dict[str, Optional[str]]:
     result = {}
     _optional = {"관리회계", "담당자", "일반통신구분", "서비스카테고리", "요청번호",
-                 "구매품목", "품목번호"}
+                 "구매품목", "품목번호", "주문품목키",
+                 "매입금액", "매출총이익", "중분류", "담당자부서", "결제유형", "이동유형"}
     for key, cands in spec.items():
         result[key] = detect_col(df, cands, required=(key not in _optional))
     return result
@@ -135,32 +143,36 @@ def build_col_map(df: pd.DataFrame, spec: dict) -> Dict[str, Optional[str]]:
 class MappingMaster:
     def __init__(self, path: Optional[Path]):
         self.path      = path
-        self.svccat    : Dict[str, Tuple[str, str]] = {}  # {카테고리: (관리회계, 담당자)}
+        self.svccat    : Dict[str, Tuple[str, str, str]] = {}  # {카테고리: (관리회계, 담당자, 담당자부서)}
         self.person_type: Dict[str, str]             = {}  # {담당자: 일반/통신}
         self.corp_size  : Dict[str, str]             = {}  # {협력사명: 규모}
         self.loaded     = False
 
     def load(self, log):
         if not self.path or not self.path.exists():
-            log.warning("  mapping_master.xlsx 없음 → 관리회계·담당자·일반통신구분·기업규모 공란 처리")
+            log.warning("  mapping_master.xlsx 없음 → 관리회계·담당자·담당자부서·일반통신구분·기업규모 공란 처리")
             return
         try:
-            # 시트1: 서비스카테고리
+            # 시트1: 서비스카테고리 → 관리회계/담당자/담당자부서
+            # 실제 컬럼명: "서비스 카테고리", "관리회계 카테고리(안)", "담당부서(안)", "상품담당자(26.05)"
             df1 = pd.read_excel(self.path, sheet_name=0, dtype=str, engine="openpyxl").fillna("")
             c1 = df1.columns.tolist()
-            # 컬럼 위치 유연하게 탐지
-            cat_c = next((c for c in c1 if "서비스카테고리" in c or "카테고리" in c), c1[0])
-            acc_c = next((c for c in c1 if "관리회계" in c), c1[1] if len(c1) > 1 else None)
-            mgr_c = next((c for c in c1 if "담당자" in c), c1[2] if len(c1) > 2 else None)
+            cat_c  = next((c for c in c1 if "서비스" in c and "카테고리" in c),
+                          next((c for c in c1 if "카테고리" in c), c1[0]))
+            acc_c  = next((c for c in c1 if "관리회계" in c), None)
+            dept_c = next((c for c in c1 if "담당부서" in c), None)
+            mgr_c  = next((c for c in c1 if "담당자" in c and "부서" not in c), None)
+            log.info(f"  시트1 컬럼 탐지: cat={cat_c}, acc={acc_c}, dept={dept_c}, mgr={mgr_c}")
             for _, r in df1.iterrows():
                 k = str(r[cat_c]).strip()
                 if k:
                     self.svccat[k] = (
-                        str(r[acc_c]).strip() if acc_c else "",
-                        str(r[mgr_c]).strip() if mgr_c else "",
+                        str(r[acc_c]).strip()  if acc_c  else "",   # 관리회계
+                        str(r[mgr_c]).strip()  if mgr_c  else "",   # 담당자
+                        str(r[dept_c]).strip() if dept_c else "",   # 담당자부서
                     )
 
-            # 시트2: 일반통신구분
+            # 시트2: 일반통신구분 (담당자 → 일반/통신)
             df2 = pd.read_excel(self.path, sheet_name=1, dtype=str, engine="openpyxl").fillna("")
             c2 = df2.columns.tolist()
             per_c  = next((c for c in c2 if "담당자" in c), c2[0])
@@ -181,62 +193,67 @@ class MappingMaster:
                     self.corp_size[k] = str(r[size_c]).strip()
 
             self.loaded = True
-            log.info(f"  mapping_master 로드: 서비스카테고리 {len(self.svccat)}건 / "
+            log.info(f"  mapping_master 로드 완료: 서비스카테고리 {len(self.svccat)}건 / "
                      f"일반통신구분 {len(self.person_type)}건 / 기업규모 {len(self.corp_size)}건")
         except Exception as e:
             log.warning(f"  mapping_master 로드 실패: {e}")
 
-    def apply(self, df: pd.DataFrame, kt_cols: Dict[str, Optional[str]], log) -> pd.DataFrame:
-        """서비스카테고리 → 관리회계/담당자/일반통신구분 채우기 (기존값 우선, 벡터 연산)"""
-        svc_col  = kt_cols.get("서비스카테고리")
-        acc_col  = kt_cols.get("관리회계")  or "관리회계"
-        mgr_col  = kt_cols.get("담당자")    or "담당자"
-        type_col = kt_cols.get("일반통신구분") or "일반/통신구분"
+    def apply(self, df: pd.DataFrame, merged_cols: Dict[str, Optional[str]], log) -> pd.DataFrame:
+        """서비스카테고리 → 관리회계/담당자/담당자부서/중분류/일반통신구분 채우기 (기존값 우선, 벡터 연산)"""
+        svc_col  = merged_cols.get("서비스카테고리")
+        acc_col  = merged_cols.get("관리회계")     or "관리회계"
+        mgr_col  = merged_cols.get("담당자")       or "담당자"
+        type_col = merged_cols.get("일반통신구분") or "일반/통신구분"
+        dept_col = merged_cols.get("담당자부서")   or "담당자부서"
+        mdiv_col = merged_cols.get("중분류")       or "중분류(IP만변경적용)"
 
-        # 컬럼 생성 + 문자열 dtype 강제 (빈 셀이 float64로 읽힐 수 있음)
-        for col in [acc_col, mgr_col, type_col]:
+        # 컬럼 생성 + 문자열 dtype 강제
+        for col in [acc_col, mgr_col, type_col, dept_col, mdiv_col]:
             if col not in df.columns:
                 df[col] = ""
             df[col] = df[col].fillna("").astype(str)
 
         def _blank(series):
-            """공백/None인 셀 마스크"""
             return series.astype(str).str.strip().isin(["", "None", "nan"])
 
         fail_cats = set()
         stats = {"관리회계": [0, 0], "담당자": [0, 0], "일반통신구분": [0, 0]}
 
-        # ── 서비스카테고리 → 관리회계 / 담당자 (벡터) ──
+        # ── 서비스카테고리 → 관리회계 / 담당자 / 담당자부서 (벡터) ──
         if svc_col and svc_col in df.columns:
             df["_svc"] = df[svc_col].astype(str).str.strip()
-            df["_acc_mapped"] = df["_svc"].map(
-                lambda x: self.svccat.get(x, (None, None))[0]
-            )
-            df["_mgr_mapped"] = df["_svc"].map(
-                lambda x: self.svccat.get(x, (None, None))[1]
-            )
-            # 기존값 없으면 매핑값으로 채움
+            df["_acc_mapped"]  = df["_svc"].map(lambda x: self.svccat.get(x, ("", "", ""))[0])
+            df["_mgr_mapped"]  = df["_svc"].map(lambda x: self.svccat.get(x, ("", "", ""))[1])
+            df["_dept_mapped"] = df["_svc"].map(lambda x: self.svccat.get(x, ("", "", ""))[2])
+
             acc_blank = _blank(df[acc_col])
             df.loc[acc_blank, acc_col] = df.loc[acc_blank, "_acc_mapped"]
+
             mgr_blank = _blank(df[mgr_col])
             df.loc[mgr_blank, mgr_col] = df.loc[mgr_blank, "_mgr_mapped"]
 
+            dept_blank = _blank(df[dept_col])
+            df.loc[dept_blank, dept_col] = df.loc[dept_blank, "_dept_mapped"]
+
+            # 중분류(IP만변경적용) = 관리회계와 동일값 (비어 있을 때만 채움)
+            mdiv_blank = _blank(df[mdiv_col])
+            df.loc[mdiv_blank, mdiv_col] = df.loc[mdiv_blank, acc_col]
+
             # 통계
-            mapped   = df["_acc_mapped"].notna() & (df["_acc_mapped"] != "")
+            mapped   = df["_acc_mapped"].notna() & (df["_acc_mapped"].str.strip() != "")
             unmapped = ~mapped
             stats["관리회계"] = [int(mapped.sum()), int(unmapped.sum())]
             stats["담당자"]   = [int(mapped.sum()), int(unmapped.sum())]
-            fail_cats = set(df.loc[unmapped & (df["_svc"] != "") & (df["_svc"] != "nan"),
-                                   "_svc"].tolist())
-            df.drop(columns=["_svc", "_acc_mapped", "_mgr_mapped"], inplace=True)
+            fail_cats = set(df.loc[unmapped & ~_blank(df["_svc"]), "_svc"].tolist())
+            df.drop(columns=["_svc", "_acc_mapped", "_mgr_mapped", "_dept_mapped"], inplace=True)
 
         # ── 담당자 → 일반/통신구분 (담당자 컬럼이 채워진 뒤에 적용) ──
-        df["_mgr_clean"] = df[mgr_col].astype(str).str.strip()
+        df["_mgr_clean"]   = df[mgr_col].astype(str).str.strip()
         df["_type_mapped"] = df["_mgr_clean"].map(self.person_type)
         type_blank = _blank(df[type_col])
         df.loc[type_blank, type_col] = df.loc[type_blank, "_type_mapped"]
 
-        ok_type = df["_type_mapped"].notna()
+        ok_type = df["_type_mapped"].notna() & (df["_type_mapped"].str.strip() != "")
         stats["일반통신구분"] = [int(ok_type.sum()), int((~ok_type).sum())]
         df.drop(columns=["_mgr_clean", "_type_mapped"], inplace=True)
 
@@ -339,25 +356,30 @@ class SettlementRunner:
         # 플랫폼 요청번호(optional) 별도 탐지
         self.pl_cols["요청번호"] = detect_col(df_pl, _PL_OPT["요청번호"], required=False)
 
-        LINE = "─" * 55
+        LINE = "-" * 55
         print(f"\n{LINE}")
-        print("▶ KT 파일 컬럼 탐지 결과:")
+        print("[KT 파일 컬럼 탐지 결과]")
         for key, found in self.kt_cols.items():
-            mark = "✓" if found else "─"
-            print(f"  {mark} {key:<14} → {found or '(미탐지)'}")
+            mark = "O" if found else "-"
+            print(f"  [{mark}] {key:<14} : {found or '(미탐지)'}")
 
-        print(f"\n▶ 플랫폼 파일 컬럼 탐지 결과:")
+        print(f"\n[플랫폼 파일 컬럼 탐지 결과]")
         for key, found in self.pl_cols.items():
-            mark = "✓" if found else "─"
-            print(f"  {mark} {key:<14} → {found or '(없음)'}")
+            mark = "O" if found else "-"
+            print(f"  [{mark}] {key:<14} : {found or '(없음)'}")
 
-        req_col = self.pl_cols.get("요청번호")
-        kt_item = self.kt_cols.get("구매품목")
-        pl_item = self.pl_cols.get("품목번호")
-        key_mode = (f"복합 키  ({self.kt_cols['주문번호']}+{kt_item}  ↔  "
-                    f"{self.pl_cols['주문번호']}+{pl_item})"
-                    if kt_item and pl_item else
-                    f"단순 키  ({self.kt_cols['주문번호']} ↔ {self.pl_cols['주문번호']})")
+        req_col  = self.pl_cols.get("요청번호")
+        kt_item  = self.kt_cols.get("구매품목")
+        pl_item  = self.pl_cols.get("품목번호")
+        pl_combo = self.pl_cols.get("주문품목키")
+        if kt_item and pl_combo:
+            key_mode = (f"복합 키  ({self.kt_cols['주문번호']}+{kt_item} (KT)  ↔  "
+                        f"{pl_combo} (플랫폼, 사전계산)")
+        elif kt_item and pl_item:
+            key_mode = (f"복합 키  ({self.kt_cols['주문번호']}+{kt_item}  ↔  "
+                        f"{self.pl_cols['주문번호']}+{pl_item})")
+        else:
+            key_mode = f"단순 키  ({self.kt_cols['주문번호']} ↔ {self.pl_cols['주문번호']})"
         print(f"\n▶ 매칭 키 모드  : {key_mode}")
         print(f"▶ 반품 처리 경로: {'A (요청번호 직접 매칭)' if req_col else 'B (return_mapping.xlsx 사용)'}")
         print(LINE)
@@ -408,7 +430,7 @@ class SettlementRunner:
     # ── 복합 키 생성 ────────────────────────────────────────────
     @staticmethod
     def _item_str(series: pd.Series) -> pd.Series:
-        """품목번호를 정수 문자열로 정규화: 10.0 → '10', '010' → '10', '' → ''"""
+        """품목번호(Series)를 정수 문자열로 정규화: 10.0 → '10', '010' → '10', '' → ''"""
         def _conv(v):
             s = str(v).strip()
             if s in ("", "nan", "None"): return ""
@@ -418,27 +440,55 @@ class SettlementRunner:
                 return s
         return series.apply(_conv)
 
+    @staticmethod
+    def _key_str(v) -> str:
+        """주문&품목 단일 값(Excel float 또는 문자열) → 정수 or 원본 문자열 변환.
+        예: 4.50201e+11 → '450200980415'   'ORD-2025-00110' → 'ORD-2025-00110'
+        """
+        s = str(v).strip()
+        if s in ("", "nan", "None"):
+            return ""
+        try:
+            return str(int(float(s)))
+        except (ValueError, TypeError):
+            return s
+
     def _assign_match_keys(self):
         """KT와 플랫폼 DataFrame에 _match_key 컬럼 부여.
-        구매문서번호+구매품목 ↔ 주문번호+품목번호 (구분자 없이 연결)
-        품목번호 컬럼이 없으면 주문번호만 사용(단순 키 폴백).
+        - 플랫폼에 '주문&품목' 사전계산 키가 있으면 직접 사용 (_key_str 변환)
+        - 없으면 주문번호+품목번호 연결 (구분자 없음)
+        - KT는 항상 구매문서번호+구매품목 연결
         """
-        kt_ord  = self.kt_cols["주문번호"]
-        pl_ord  = self.pl_cols["주문번호"]
-        kt_item = self.kt_cols.get("구매품목")
-        pl_item = self.pl_cols.get("품목번호")
+        kt_ord      = self.kt_cols["주문번호"]    # 구매문서번호
+        pl_ord      = self.pl_cols["주문번호"]    # 주문번호
+        kt_item     = self.kt_cols.get("구매품목")
+        pl_combo_col = self.pl_cols.get("주문품목키")   # 주문&품목 (사전계산)
+        pl_item     = self.pl_cols.get("품목번호")
 
-        if kt_item and pl_item and kt_item in self.df_kt.columns and pl_item in self.df_pl.columns:
+        if kt_item and kt_item in self.df_kt.columns:
+            # KT: 구매문서번호 + 구매품목
+            kt_key = (self.df_kt[kt_ord].fillna("").astype(str)
+                      + self._item_str(self.df_kt[kt_item]))
             self.composite_key = True
-            self.df_kt["_match_key"] = (
-                self.df_kt[kt_ord].fillna("").astype(str)
-                + self._item_str(self.df_kt[kt_item])
-            )
-            self.df_pl["_match_key"] = (
-                self.df_pl[pl_ord].fillna("").astype(str)
-                + self._item_str(self.df_pl[pl_item])
-            )
-            self.log.info(f"  복합 키 생성: {kt_ord}+{kt_item} ↔ {pl_ord}+{pl_item}")
+
+            if pl_combo_col and pl_combo_col in self.df_pl.columns:
+                # 플랫폼: 주문&품목 사전계산 키 직접 사용 (float → int str 변환)
+                pl_key = self.df_pl[pl_combo_col].apply(self._key_str)
+                self.log.info(f"  복합 키: {kt_ord}+{kt_item} (KT) ↔ {pl_combo_col} (플랫폼, 사전계산)")
+            elif pl_item and pl_item in self.df_pl.columns:
+                # 플랫폼: 주문번호 + 품목번호 직접 연결
+                pl_key = (self.df_pl[pl_ord].fillna("").astype(str)
+                          + self._item_str(self.df_pl[pl_item]))
+                self.log.info(f"  복합 키: {kt_ord}+{kt_item} ↔ {pl_ord}+{pl_item}")
+            else:
+                # 폴백: 단순 키
+                pl_key = self.df_pl[pl_ord].fillna("").astype(str)
+                kt_key = self.df_kt[kt_ord].fillna("").astype(str)
+                self.composite_key = False
+                self.log.info(f"  단순 키 폴백: {kt_ord} ↔ {pl_ord} (품목번호 컬럼 없음)")
+
+            self.df_kt["_match_key"] = kt_key
+            self.df_pl["_match_key"] = pl_key
         else:
             self.composite_key = False
             self.df_kt["_match_key"] = self.df_kt[kt_ord].fillna("").astype(str)
@@ -782,58 +832,230 @@ class SettlementRunner:
         self.log.info("  [시트2] 매출현황 작성...")
         ws = wb.create_sheet("②매출현황")
         df = self.df_invoice.copy()
+
+        # ── 컬럼 탐지 ──
         amt_col  = self.pl_cols["정산금액"]
-        tax_col  = self.pl_cols.get("매출과세구분")
-        type_col = self.kt_cols.get("일반통신구분") or "일반/통신구분"
+        buy_col  = self.pl_cols.get("매입금액")
+        gp_col   = self.pl_cols.get("매출총이익")
+        type_col = next((c for c in ["일반/통신구분", "일반통신구분"]
+                         if c in df.columns), None)
+        mdiv_col = next((c for c in ["중분류(IP만변경적용)", "중분류", "관리회계",
+                                      "관리회계(IP만변경적용)"] if c in df.columns), None)
+        dept_col = next((c for c in ["담당자부서"] if c in df.columns), None)
 
-        df[amt_col] = pd.to_numeric(df[amt_col], errors="coerce").fillna(0)
+        # ── 수치 변환 ──
+        for col in filter(None, [amt_col, buy_col, gp_col]):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-        def _write_block(ws, start_row, title, grp_col, grp_df, col_label):
-            """집계 블록 작성 → SUM 수식 합계행 포함. 다음 시작 행 반환"""
-            ws.cell(start_row, 1, title).font = Font(name=FONT, bold=True,
-                                                      size=12, color=HDR_BLUE)
-            r = start_row + 1
-            for c, h in enumerate([col_label, "건수", "정산금액합계"], 1):
-                hdr_cell(ws.cell(r, c, h))
-            ws.column_dimensions["A"].width = 22
-            ws.column_dimensions["B"].width = 10
-            ws.column_dimensions["C"].width = 22
+        # ── 통신/일반 분리 ──
+        if type_col:
+            df_t = df[df[type_col].astype(str).str.strip() == "통신"].copy()
+            df_g = df[df[type_col].astype(str).str.strip() == "일반"].copy()
+        else:
+            df_t = pd.DataFrame(columns=df.columns)
+            df_g = df.copy()
+
+        # ── 중분류별 집계 ──
+        def _agg_by_mdiv(sub_df):
+            if sub_df.empty or not mdiv_col or mdiv_col not in sub_df.columns:
+                return pd.DataFrame(columns=["중분류", "정산금액", "매입금액", "매출총이익"])
+            agg = {"정산금액": (amt_col, "sum")}
+            if buy_col and buy_col in sub_df.columns:
+                agg["매입금액"] = (buy_col, "sum")
+            if gp_col and gp_col in sub_df.columns:
+                agg["매출총이익"] = (gp_col, "sum")
+            result = sub_df.groupby(mdiv_col).agg(**agg).reset_index()
+            result.rename(columns={mdiv_col: "중분류"}, inplace=True)
+            if "매입금액" not in result.columns:
+                result["매입금액"] = 0
+            if "매출총이익" not in result.columns:
+                result["매출총이익"] = 0
+            return result.sort_values("정산금액", ascending=False).reset_index(drop=True)
+
+        grp_t = _agg_by_mdiv(df_t)
+        grp_g = _agg_by_mdiv(df_g)
+
+        # ── 열 너비 ──
+        for col_letter, width in [("A", 26), ("B", 16), ("C", 16), ("D", 16),
+                                    ("E", 2),  ("F", 22), ("G", 16), ("H", 16), ("I", 16)]:
+            ws.column_dimensions[col_letter].width = width
+
+        # ── 섹션 작성 함수 (통신/일반 공통) ──
+        def _write_section(start_row, section_name, grp_df, col_base=1):
+            r = start_row
+            # 섹션 제목
+            title = ws.cell(r, col_base, f"▶ {section_name}")
+            title.font = Font(name=FONT, bold=True, size=12, color=HDR_BLUE)
+            ws.merge_cells(start_row=r, start_column=col_base,
+                           end_row=r, end_column=col_base + 3)
+            ws.row_dimensions[r].height = 22
+            r += 1
+            # 헤더
+            for ci, h in enumerate(["중분류(관리회계)", "정산금액", "매입금액", "매출총이익"], col_base):
+                hdr_cell(ws.cell(r, ci, h))
+            ws.row_dimensions[r].height = 18
             data_start = r + 1
             r += 1
-            rows_written = 0
-            for _, row in grp_df.iterrows():
-                fill = ROW_EVEN if r % 2 == 0 else None
-                ws.cell(r, 1, row[grp_col]).font = Font(name=FONT, size=10)
-                if fill:
-                    ws.cell(r, 1).fill = PatternFill("solid", start_color=fill)
-                data_cell(ws.cell(r, 2, int(row["건수"])))
-                data_cell(ws.cell(r, 3, row["합계"]), money=True)
-                r += 1; rows_written += 1
-            # 합계 행 (SUM 수식)
+            # 데이터 행
+            if grp_df.empty:
+                c0 = ws.cell(r, col_base, "(데이터 없음)")
+                c0.font = Font(name=FONT, size=10, color="808080", italic=True)
+                c0.border = _bdr()
+                r += 1
+            else:
+                for offset, (_, dr) in enumerate(grp_df.iterrows()):
+                    ri = r + offset
+                    fill = ROW_EVEN if ri % 2 == 0 else None
+                    c0 = ws.cell(ri, col_base, str(dr.get("중분류", "")))
+                    c0.font = Font(name=FONT, size=10)
+                    c0.border = _bdr()
+                    c0.alignment = Alignment(horizontal="left", vertical="center")
+                    if fill:
+                        c0.fill = PatternFill("solid", start_color=fill)
+                    for ci_off, col_name in enumerate(["정산금액", "매입금액", "매출총이익"], 1):
+                        v = dr.get(col_name, 0)
+                        cell = ws.cell(ri, col_base + ci_off, float(v) if pd.notna(v) else 0.0)
+                        data_cell(cell, fill=fill, money=True)
+                r += len(grp_df)
             data_end = r - 1
-            total_cell(ws.cell(r, 1, "합계"))
-            total_cell(ws.cell(r, 2, f"=SUM(B{data_start}:B{data_end})"))
-            ws.cell(r, 2).number_format = "#,##0"
-            tc = ws.cell(r, 3, f"=SUM(C{data_start}:C{data_end})")
-            total_cell(tc, money=True)
-            return r + 2
+            # 합계 행 (SUM 수식)
+            total_cell(ws.cell(r, col_base, f"{section_name} 총액"))
+            ws.cell(r, col_base).alignment = Alignment(horizontal="left", vertical="center")
+            for ci_off in range(1, 4):
+                cl = get_column_letter(col_base + ci_off)
+                tc = ws.cell(r, col_base + ci_off, f"=SUM({cl}{data_start}:{cl}{data_end})")
+                total_cell(tc, money=True)
+            ws.row_dimensions[r].height = 18
+            return r + 2   # 빈 행 포함
 
+        # ── 좌측 블록 (A:D): 통신 → 일반 ──
         row = 1
-        # ─ 과세구분별 ─
-        if tax_col and tax_col in df.columns:
-            grp1 = df.groupby(tax_col)[amt_col].agg(건수="count", 합계="sum").reset_index()
-            row = _write_block(ws, row, "▶ 과세구분별 집계", tax_col, grp1, "과세구분")
-        else:
-            ws.cell(row, 1, "매출과세구분 컬럼 없음").font = Font(color="FF0000", bold=True, name=FONT)
-            row += 2
+        row = _write_section(row, "통신", grp_t, col_base=1)
+        row = _write_section(row, "일반", grp_g, col_base=1)
 
-        # ─ 일반/통신 구분별 ─
-        if type_col in df.columns and df[type_col].notna().any():
-            grp2 = df.groupby(type_col)[amt_col].agg(건수="count", 합계="sum").reset_index()
-            _write_block(ws, row, "▶ 일반/통신 구분별 집계", type_col, grp2, "구분")
-        else:
-            ws.cell(row, 1, "일반/통신구분 매핑 확인 필요 (mapping_master.xlsx)").font = \
-                Font(color="FF6600", bold=True, name=FONT, italic=True)
+        # ── 우측 블록 (F:I): 검증 요약 + 담당자부서별 ──
+        RC = 6   # F열 시작
+
+        # KT 공급가액 합계 (정답지)
+        kt_amt_col = self.kt_cols["정산금액"]
+        kt_total = 0.0
+        if self.df_kt is not None and kt_amt_col in self.df_kt.columns:
+            kt_total = float(pd.to_numeric(self.df_kt[kt_amt_col], errors="coerce").fillna(0).sum())
+
+        pl_t_total = float(df_t[amt_col].sum()) if not df_t.empty else 0.0
+        pl_g_total = float(df_g[amt_col].sum()) if not df_g.empty else 0.0
+        pl_total   = pl_t_total + pl_g_total
+
+        # 반품 금액 합계
+        ret_total = 0.0
+        if self.df_ret_ok is not None and len(self.df_ret_ok) > 0:
+            rk = self.kt_cols.get("정산금액")
+            if rk and rk in self.df_ret_ok.columns:
+                ret_total = float(pd.to_numeric(self.df_ret_ok[rk], errors="coerce").fillna(0).sum())
+
+        verified = abs((pl_total + ret_total) - kt_total) <= 1
+
+        right_row = 1
+
+        # 검증 요약 제목
+        t = ws.cell(right_row, RC, "▶ 검증 요약")
+        t.font = Font(name=FONT, bold=True, size=12, color=HDR_BLUE)
+        ws.merge_cells(start_row=right_row, start_column=RC,
+                       end_row=right_row, end_column=RC + 2)
+        ws.row_dimensions[right_row].height = 22
+        right_row += 1
+
+        # 헤더
+        for ci, h in enumerate(["구분", "금액"], RC):
+            hdr_cell(ws.cell(right_row, ci, h), color=HDR_GREEN)
+        right_row += 1
+
+        # 요약 행
+        for label, val, is_money in [
+            ("통신 합계",              pl_t_total, True),
+            ("일반 합계",              pl_g_total, True),
+            ("플랫폼 총합계",          pl_total,   True),
+            ("반품 금액",              ret_total,  True),
+            ("KT 금액 합계 (정답지)",  kt_total,   True),
+            ("검증 (플랫폼+반품 = KT)", "TRUE (일치)" if verified else "FALSE (차이있음)", False),
+        ]:
+            lc = ws.cell(right_row, RC, label)
+            lc.font = Font(name=FONT, size=10,
+                           bold=(label in ("플랫폼 총합계", "KT 금액 합계 (정답지)",
+                                           "검증 (플랫폼+반품 = KT)")))
+            lc.border = _bdr()
+            lc.alignment = Alignment(horizontal="left", vertical="center")
+
+            if is_money:
+                vc = ws.cell(right_row, RC + 1, float(val))
+                data_cell(vc, money=True,
+                          fill="CCFFCC" if float(val) >= 0 else "FFD0D0")
+            else:
+                vc = ws.cell(right_row, RC + 1, val)
+                vc.font  = Font(name=FONT, size=10, bold=True,
+                                color=("375623" if verified else "C00000"))
+                vc.fill  = PatternFill("solid",
+                                       start_color=("CCFFCC" if verified else "FFCCCC"))
+                vc.border = _bdr()
+                vc.alignment = Alignment(horizontal="center", vertical="center")
+            right_row += 1
+
+        right_row += 1   # 빈 행
+
+        # 담당자부서별 집계 (통신)
+        if dept_col and not df_t.empty and dept_col in df_t.columns:
+            t2 = ws.cell(right_row, RC, "▶ 담당자부서별 (통신)")
+            t2.font = Font(name=FONT, bold=True, size=12, color=HDR_BLUE)
+            ws.merge_cells(start_row=right_row, start_column=RC,
+                           end_row=right_row, end_column=RC + 3)
+            ws.row_dimensions[right_row].height = 22
+            right_row += 1
+
+            for ci, h in enumerate(["담당자부서", "정산금액", "매입금액", "매출총이익"], RC):
+                hdr_cell(ws.cell(right_row, ci, h), color=HDR_GREEN)
+            right_row += 1
+            dept_data_start = right_row
+
+            dagg = {"정산금액": (amt_col, "sum")}
+            if buy_col and buy_col in df_t.columns:
+                dagg["매입금액"] = (buy_col, "sum")
+            if gp_col and gp_col in df_t.columns:
+                dagg["매출총이익"] = (gp_col, "sum")
+            grp_dept = df_t.groupby(dept_col).agg(**dagg).reset_index()
+            grp_dept.rename(columns={dept_col: "담당자부서"}, inplace=True)
+            if "매입금액" not in grp_dept.columns:
+                grp_dept["매입금액"] = 0
+            if "매출총이익" not in grp_dept.columns:
+                grp_dept["매출총이익"] = 0
+
+            for offset, (_, dr) in enumerate(grp_dept.iterrows()):
+                ri = right_row + offset
+                fill = ROW_EVEN if ri % 2 == 0 else None
+                c0 = ws.cell(ri, RC, str(dr["담당자부서"]))
+                c0.font = Font(name=FONT, size=10)
+                c0.border = _bdr()
+                c0.alignment = Alignment(horizontal="left", vertical="center")
+                if fill:
+                    c0.fill = PatternFill("solid", start_color=fill)
+                for ci_off, col_name in enumerate(["정산금액", "매입금액", "매출총이익"], 1):
+                    v = dr.get(col_name, 0)
+                    cell = ws.cell(ri, RC + ci_off, float(v) if pd.notna(v) else 0.0)
+                    data_cell(cell, fill=fill, money=True)
+            right_row += len(grp_dept)
+            dept_data_end = right_row - 1
+
+            # 합계 행
+            total_cell(ws.cell(right_row, RC, "합 계"))
+            ws.cell(right_row, RC).alignment = Alignment(horizontal="left", vertical="center")
+            for ci_off in range(1, 4):
+                cl = get_column_letter(RC + ci_off)
+                tc = ws.cell(right_row, RC + ci_off,
+                             f"=SUM({cl}{dept_data_start}:{cl}{dept_data_end})")
+                total_cell(tc, money=True)
+
+        ws.freeze_panes = "A2"
+        self.log.info(f"    → 통신 {len(grp_t)}개 중분류 / 일반 {len(grp_g)}개 중분류")
 
     # ── 시트3: 어음확인_최종 ───────────────────────────────────
     def write_bill_sheet(self, wb):
