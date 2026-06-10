@@ -12,7 +12,7 @@ if not exist wheels mkdir wheels
 
 set PY_VER=314
 set PYPI=https://pypi.org/simple
-set PKGS=pandas numpy statsmodels scikit-learn openpyxl xlsxwriter
+set PKGS=pandas numpy statsmodels scikit-learn openpyxl xlsxwriter pyarrow
 
 echo [INFO] Target : cp%PY_VER%, win_amd64
 echo [INFO] Dest   : .\wheels\

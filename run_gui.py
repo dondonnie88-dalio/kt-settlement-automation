@@ -111,12 +111,14 @@ class _GUIRunner(SettlementRunner):
     """파일 경로·정산 기간을 생성자로 받아 사용자 입력 없이 전체 실행"""
 
     def __init__(self, kt: str, pl: str, mm: str, rm: str,
-                 start: datetime.date, end: datetime.date):
+                 start: datetime.date, end: datetime.date,
+                 round_override: str = None):
         # base_dir = KT 파일이 있는 폴더 → 결과 파일도 같은 위치에 저장
         super().__init__(base_dir=str(Path(kt).parent))
         self._kt, self._pl = kt, pl
         self._mm, self._rm = mm, rm
         self._start, self._end = start, end
+        self._round_override = round_override  # None이면 자동 판단
 
     # ── 파일 탐지: input() 대신 생성자 파라미터 사용 ──────────────
     def detect_files(self):
@@ -259,6 +261,19 @@ class SettlementApp:
         ttk.Button(di, text="자동 판단",
                    command=self._auto_date).pack(side=tk.LEFT, padx=(14, 0))
         ttk.Label(di, text="  YYYY-MM-DD",
+                  foreground="#888888", font=("맑은 고딕", 8)).pack(side=tk.LEFT)
+
+        # 차수 선택
+        di2 = ttk.Frame(df); di2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(di2, text="차수 선택").pack(side=tk.LEFT)
+        self.v_round = tk.StringVar(value="자동")
+        ttk.Combobox(
+            di2, textvariable=self.v_round,
+            values=["자동", "1차", "2차"],
+            state="readonly", width=6,
+            font=("맑은 고딕", 10),
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(di2, text="  ※ 자동: 시작일 기준 판단 (1일~15일→1차, 16일~→2차)",
                   foreground="#888888", font=("맑은 고딕", 8)).pack(side=tk.LEFT)
 
         # ── 실행 버튼 / 상태 ───────────────────────────────────
@@ -408,7 +423,10 @@ class SettlementApp:
 
         def _worker():
             try:
-                runner = _GUIRunner(kt, pl, mm, rm, s_date, e_date)
+                _round_sel = self.v_round.get()
+                _round_ov  = None if _round_sel == "자동" else _round_sel
+                runner = _GUIRunner(kt, pl, mm, rm, s_date, e_date,
+                                    round_override=_round_ov)
 
                 # 기존 TkLogHandler 제거 (재실행 시 중복 방지)
                 for h in list(runner.log.handlers):
@@ -425,10 +443,9 @@ class SettlementApp:
 
                 runner.run()
 
-                # 결과 파일 경로 계산 (run() 이 self.base 에 저장)
-                today_str = datetime.date.today().strftime("%Y%m%d")
-                candidate = str(Path(kt).parent / f"정산결과_{today_str}.xlsx")
-                self._result_path = candidate if os.path.exists(candidate) else None
+                # 결과 파일 경로: runner.result_path 에 저장된 실제 경로 사용
+                candidate = getattr(runner, "result_path", None)
+                self._result_path = candidate if candidate and os.path.exists(candidate) else None
 
                 self.root.after(0, self._on_done)
 

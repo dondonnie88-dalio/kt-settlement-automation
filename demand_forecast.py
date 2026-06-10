@@ -15,6 +15,7 @@ REQUIRED_PKGS = {
     "scikit-learn": "sklearn",      # ← pip명과 모듈명이 다름
     "openpyxl":     "openpyxl",
     "xlsxwriter":   "xlsxwriter",
+    "pyarrow":      "pyarrow",      # ← parquet 저장/로드용
 }
 
 def _detect_win_proxy():
@@ -153,21 +154,24 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
-CONFIG_FILE = BASE_DIR / "forecast_config.json"
+CONFIG_FILE  = BASE_DIR / "forecast_config.json"
+PARQUET_FILE = BASE_DIR / "processed_data.parquet"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 0-A. 설정 저장/로드
 # ════════════════════════════════════════════════════════════════════════════
 import json
 
-def save_config(filepaths: list, lead_time: int, lt_file_path, col_map: dict):
+def save_config(filepaths: list, lead_time: int, lt_file_path, col_map: dict,
+                processed_files: list = None):
     """분석 설정을 JSON 파일에 저장 (다음 실행 시 재사용)"""
     cfg = {
-        "filepaths":   [str(p) for p in filepaths],
-        "lead_time":   lead_time,
-        "lt_file":     str(lt_file_path) if lt_file_path else None,
-        "col_map":     col_map,
-        "saved_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "filepaths":        [str(p) for p in filepaths],
+        "lead_time":        lead_time,
+        "lt_file":          str(lt_file_path) if lt_file_path else None,
+        "col_map":          col_map,
+        "saved_at":         datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "processed_files":  processed_files or [],
     }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -217,6 +221,195 @@ def prompt_use_saved_config(cfg: dict) -> bool:
 
     ans = input("\n이 설정으로 바로 실행하시겠습니까? (Y/n): ").strip().lower()
     return ans != "n"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 0-B. 누적 데이터 저장/로드 (RAW 파일 삭제 후에도 분석 가능)
+# ════════════════════════════════════════════════════════════════════════════
+def save_processed_data(df: pd.DataFrame, processed_files: list):
+    """전처리된 DataFrame을 parquet으로 저장. 이후 RAW 파일 없이도 분석 가능."""
+    if df is None or len(df) == 0:
+        log.warning("저장할 데이터가 없음 (0행) → parquet 저장 건너뜀")
+        return
+    try:
+        # Period/혼합타입 컬럼 → 문자열 변환 후 저장
+        df_save = df.copy()
+        if "_ym" in df_save.columns:
+            df_save["_ym"] = df_save["_ym"].astype(str)
+        if "_date" in df_save.columns:
+            df_save["_date"] = df_save["_date"].astype(str)
+        # object 타입 컬럼(혼합 int/str 등) → str 통일
+        for col in df_save.columns:
+            if df_save[col].dtype == object:
+                df_save[col] = df_save[col].astype(str)
+        df_save.to_parquet(PARQUET_FILE, index=False, engine="pyarrow")
+        size_mb = PARQUET_FILE.stat().st_size / 1024 / 1024
+        log.info(f"누적 데이터 저장: {PARQUET_FILE.name} "
+                 f"({len(df_save):,}행, {size_mb:.1f}MB, "
+                 f"파일 {len(processed_files)}개 누적)")
+    except Exception as e:
+        log.warning(f"누적 데이터 저장 실패: {e}")
+
+
+def load_processed_data() -> pd.DataFrame | None:
+    """저장된 parquet 로드. 없거나 실패 시 None 반환."""
+    if not PARQUET_FILE.exists():
+        return None
+    try:
+        df = pd.read_parquet(PARQUET_FILE, engine="pyarrow")
+        # 빈 parquet(이전 오류 실행 잔재) → None 반환해 재처리 유도
+        if len(df) == 0:
+            log.warning("누적 데이터 0행 감지 (이전 오류 잔재) → RAW 파일에서 재처리합니다.")
+            PARQUET_FILE.unlink(missing_ok=True)
+            return None
+        # 문자열 → 원래 타입 복원
+        if "_ym" in df.columns:
+            df["_ym"] = df["_ym"].apply(lambda x: pd.Period(x, freq="M")
+                                         if pd.notna(x) and x else pd.NaT)
+        if "_date" in df.columns:
+            df["_date"] = pd.to_datetime(df["_date"], errors="coerce")
+        # _channel 컬럼 없으면 _source_file에서 복원
+        if "_channel" not in df.columns and "_source_file" in df.columns:
+            df["_channel"] = df["_source_file"].apply(_extract_channel)
+            log.info("  _channel 컬럼 복원 완료 (파일명 기반)")
+        size_mb = PARQUET_FILE.stat().st_size / 1024 / 1024
+        log.info(f"누적 데이터 로드: {PARQUET_FILE.name} ({len(df):,}행, {size_mb:.1f}MB)")
+        return df
+    except Exception as e:
+        log.warning(f"누적 데이터 로드 실패: {e} → RAW 파일에서 재처리합니다.")
+        return None
+
+
+def load_incremental(filepaths: list, col_map: dict, lead_time: int,
+                     processed_files: list) -> tuple:
+    """
+    증분 로드: 이미 처리된 파일은 건너뛰고 새 파일만 처리 후 parquet에 병합.
+    반환: (최종 DataFrame, 업데이트된 processed_files 목록)
+    """
+    existing_df = load_processed_data()
+
+    # parquet이 없으면 processed_files 무시하고 전체 재처리
+    if existing_df is None:
+        if processed_files:
+            log.warning("누적 데이터(parquet) 없음 → processed_files 초기화 후 전체 재처리")
+        existing_names = set()
+        new_files = list(filepaths)
+    else:
+        existing_names = set(processed_files)
+        # 새 파일 = 목록에 없는 것
+        new_files = [f for f in filepaths if f.name not in existing_names]
+        # 삭제된 RAW 파일 (목록엔 있지만 실제 없는 것) → parquet으로 대체
+        missing_files = [n for n in existing_names
+                         if not any(f.name == n for f in filepaths)]
+        if missing_files:
+            log.info(f"RAW 파일 없음 (parquet으로 대체): {len(missing_files)}개 — "
+                     + ", ".join(missing_files[:3]) + ("..." if len(missing_files) > 3 else ""))
+
+    if not new_files and existing_df is not None and len(existing_df) > 0:
+        log.info("새 RAW 파일 없음 → 누적 데이터 그대로 사용")
+        return existing_df, processed_files
+
+    if new_files:
+        print(f"\n[증분 로드] 새 파일 {len(new_files)}개 처리 중...")
+        for f in new_files:
+            print(f"  + {f.name}")
+        new_df = load_and_preprocess(new_files, col_map, lead_time)
+        new_names = [f.name for f in new_files]
+    else:
+        new_df = None
+        new_names = []
+
+    # 기존 + 신규 병합
+    if existing_df is not None and new_df is not None:
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+        log.info(f"병합: 기존 {len(existing_df):,}행 + 신규 {len(new_df):,}행 = {len(combined):,}행")
+    elif existing_df is not None:
+        combined = existing_df
+    else:
+        combined = new_df
+
+    updated_files = sorted(set(list(existing_names) + new_names))
+
+    # parquet 저장 (pyarrow 없으면 건너뜀)
+    try:
+        import pyarrow  # noqa
+        save_processed_data(combined, updated_files)
+    except ImportError:
+        log.warning("pyarrow 미설치 → parquet 저장 생략 (pip install pyarrow 로 설치 가능)")
+
+    return combined, updated_files
+
+
+def _build_rightmost_map(prod_type_map: dict) -> dict:
+    """
+    기존 매핑에서 '>' 기준 마지막 키워드 → 통신/일반 딕셔너리 생성.
+    동일 키워드가 통신/일반 양쪽에 있으면 충돌로 제외.
+    예) 'CS전용 > GiGAeyes > 허브/공유기' → {'허브/공유기': '통신'}
+    """
+    rightmost_map: dict = {}
+    conflicts: set = set()
+    for cat, ptype in prod_type_map.items():
+        rightmost = cat.split(">")[-1].strip()
+        if not rightmost:
+            continue
+        if rightmost in conflicts:
+            continue
+        if rightmost in rightmost_map:
+            if rightmost_map[rightmost] != ptype:
+                conflicts.add(rightmost)
+                del rightmost_map[rightmost]
+        else:
+            rightmost_map[rightmost] = ptype
+    log.debug(f"  rightmost 매핑: {len(rightmost_map)}개 (충돌 제외: {len(conflicts)}개)")
+    return rightmost_map
+
+
+def ensure_prod_type(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
+    """
+    parquet 재사용 시 _prod_type 컬럼이 없을 수 있으므로 사후 보완.
+    이미 있으면 아무것도 하지 않음.
+
+    매칭 순서:
+      1단계) 서비스카테고리 전체 문자열 → 정확 매핑
+      2단계) 미분류 잔여 → '>' 마지막 키워드로 추론 매핑
+    """
+    if "_prod_type" in df.columns:
+        return df
+
+    prod_type_map = load_prod_type_map()
+    cat_col_name  = col_map.get("category")
+
+    if not prod_type_map or not cat_col_name or cat_col_name not in df.columns:
+        df = df.copy()
+        df["_prod_type"] = "미분류"
+        if not prod_type_map:
+            log.info("  통신/일반 구분: 매핑 파일 없음 → 전체 미분류")
+        elif not cat_col_name:
+            log.info("  통신/일반 구분: 서비스카테고리 컬럼 없음 → 전체 미분류")
+        return df
+
+    df = df.copy()
+    cat_series = df[cat_col_name].astype(str).str.strip()
+
+    # ── 1단계: 정확 매핑 ────────────────────────────────────────────────────
+    df["_prod_type"] = cat_series.map(prod_type_map).fillna("미분류")
+    n_miss = (df["_prod_type"] == "미분류").sum()
+
+    # ── 2단계: 미분류 → 마지막 키워드로 추론 ────────────────────────────────
+    if n_miss > 0:
+        rightmost_map = _build_rightmost_map(prod_type_map)
+        miss_mask = df["_prod_type"] == "미분류"
+        rightmost_series = cat_series[miss_mask].str.split(">").str[-1].str.strip()
+        inferred = rightmost_series.map(rightmost_map)
+        df.loc[miss_mask, "_prod_type"] = inferred.fillna("미분류")
+        n_inferred = inferred.notna().sum()
+        log.info(f"  2단계 추론(마지막 키워드): {n_inferred:,}행 추가 분류")
+
+    n_t = (df["_prod_type"] == "통신").sum()
+    n_g = (df["_prod_type"] == "일반").sum()
+    n_u = (df["_prod_type"] == "미분류").sum()
+    log.info(f"  통신/일반 구분 완료: 통신 {n_t:,}행 / 일반 {n_g:,}행 / 미분류 {n_u:,}행")
+    return df
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -289,15 +482,174 @@ SEARCH_PATTERNS = [
 
 # 결과·스크립트·임시 파일 제외 키워드
 EXCLUDE_KEYWORDS = ["수요예측", "분석결과", "forecast", "sample", "verify_packages",
-                    "리드타임_입력템플릿"]
+                    "리드타임_입력템플릿", "mapping_master",
+                    "카테고리목록", "미분류",       # 카테고리 참조 파일
+                    # "정산현황" 은 제외하지 않음 — 발주일자 없을 시 정산일자 fallback 처리
+                    ]
+
+# 카테고리-담당자-통신구분 파일 자동 탐지
+# 파일명에 아래 키워드가 모두 포함된 xlsx를 우선 사용, 없으면 mapping_master.xlsx fallback
+_CATEGORY_FILE_KEYWORDS = ["서비스", "카테고리", "담당자"]
+
+def _find_category_mapping_file() -> Path | None:
+    """BASE_DIR에서 카테고리-담당자 매핑 파일을 자동으로 찾아 반환.
+    ~$ 로 시작하는 Excel 임시 잠금 파일은 제외."""
+    candidates = list(BASE_DIR.glob("*.xlsx")) + list(BASE_DIR.glob("*.xlsm"))
+    for p in candidates:
+        if p.name.startswith("~$"):          # Excel 잠금 파일 제외
+            continue
+        if all(kw in p.name for kw in _CATEGORY_FILE_KEYWORDS):
+            return p
+    # fallback: mapping_master.xlsx
+    fallback = BASE_DIR / "mapping_master.xlsx"
+    return fallback if fallback.exists() else None
+
+def _dept_to_prod_type(dept: str) -> str:
+    """
+    담당부서(안) 값 → 통신/일반 변환.
+    네트워크 관련 부서 → '통신', 그 외 → '일반'
+    부서명 추가 필요 시 TELECOM_DEPT_KEYWORDS 목록에 추가하면 됨.
+    """
+    TELECOM_DEPT_KEYWORDS = ["네트워크", "network", "통신", "회선", "NW"]
+    dept_str = str(dept).strip()
+    if not dept_str or dept_str in ("nan", "None", ""):
+        return "미분류"
+    if any(kw in dept_str for kw in TELECOM_DEPT_KEYWORDS):
+        return "통신"
+    return "일반"
+
+
+def _read_cat_sheet(mapping_file: Path, sheet_name: str) -> dict:
+    """
+    단일 시트에서 { 카테고리명: "통신"|"일반" } 반환.
+    지원 형식:
+      - 신형식: 카테고리명 + 담당부서(안)  [카테고리 담당자(251229) 이후]
+      - 구형식: 카테고리 분류 + 담당부서(안)  [카테고리 담당자 (개편전)]
+    """
+    df = pd.read_excel(mapping_file, sheet_name=sheet_name,
+                       engine="openpyxl", header=0)
+    df.columns = df.columns.str.strip()
+
+    # 담당부서 컬럼 탐지
+    dept_col = next((c for c in df.columns if "담당부서" in c), None)
+    if dept_col is None:
+        dept_col = next((c for c in df.columns if "부서" in c), None)
+    if dept_col is None:
+        log.debug(f"  [{sheet_name}] 담당부서 컬럼 미발견 → 건너뜀 "
+                  f"(보유 컬럼: {list(df.columns)})")
+        return {}
+
+    # 카테고리 키 컬럼 우선순위:
+    #   1) '서비스 카테고리'  → 실제 데이터의 서비스카테고리 컬럼 값과 일치 (신형식)
+    #   2) '카테고리 분류'    → 구형식
+    #   3) 그 외 카테고리 관련 컬럼
+    # 우선순위대로 모두 매핑하되, 앞 컬럼이 없는 카테고리만 뒤 컬럼으로 보완
+    KEY_COLS_PRIORITY = ["서비스 카테고리", "카테고리 분류", "카테고리명"]
+    key_cols = [c for c in KEY_COLS_PRIORITY if c in df.columns]
+    if not key_cols:
+        key_cols = [c for c in df.columns if "카테고리" in c and "UID" not in c]
+    if not key_cols:
+        log.debug(f"  [{sheet_name}] 카테고리 컬럼 미발견 → 건너뜀")
+        return {}
+
+    result = {}
+    for key_col in reversed(key_cols):   # 낮은 우선순위부터 채운 뒤 높은 우선순위가 덮어씀
+        for _, row in df.iterrows():
+            cat  = str(row[key_col]).strip()
+            dept = str(row[dept_col]).strip()
+            if cat and cat not in ("nan", "None"):
+                result[cat] = _dept_to_prod_type(dept)
+
+    log.debug(f"  [{sheet_name}] {len(result)}개 카테고리 로드 "
+              f"(key_cols={key_cols}, dept_col='{dept_col}')")
+    return result
+
+
+def load_prod_type_map() -> dict:
+    """
+    카테고리-담당자 매핑 파일에서 카테고리 → 통신/일반 구분 딕셔너리 반환.
+
+    파일 구조:
+      - 신형식 시트 (카테고리 담당자(251229) 이후):
+          카테고리 UID | 카테고리명 | 서비스 카테고리 | 관리회계 카테고리(안) |
+          정산용 중분류 | 담당부서(안) | 상품담당자(26.05)
+      - 구형식 시트 (개편전):
+          카테고리 분류 | 관리회계 | 담당부서(안) | 변경담당자(26년 5월)
+
+    담당부서(안)에서 통신/일반 자동 판별:
+      - "네트워크", "통신", "회선", "NW" 포함 → 통신
+      - 그 외 → 일반
+
+    신형식 시트 우선, 누락 카테고리는 구형식으로 보완.
+    반환: { 카테고리명(str): "통신" | "일반" }
+    """
+    mapping_file = _find_category_mapping_file()
+    if mapping_file is None:
+        log.warning("카테고리 매핑 파일을 찾을 수 없음 → 통신/일반 구분 불가 "
+                    f"(파일명에 {_CATEGORY_FILE_KEYWORDS} 포함 필요)")
+        return {}
+    log.info(f"카테고리 매핑 파일: {mapping_file.name}")
+
+    try:
+        import openpyxl as _oxl
+        _wb = _oxl.load_workbook(mapping_file, read_only=True, data_only=True)
+        sheet_names = _wb.sheetnames
+        _wb.close()
+        log.info(f"  시트 목록: {sheet_names}")
+
+        # ── 신형식 시트: "개편전"이 아닌 카테고리 담당자 시트 (여러 개일 수 있음) ──
+        new_sheets = [s for s in sheet_names
+                      if "카테고리" in s and "담당자" in s and "개편전" not in s]
+        # ── 구형식 시트: "개편전" 포함 ──────────────────────────────────────
+        old_sheets = [s for s in sheet_names if "개편전" in s]
+
+        if not new_sheets and not old_sheets:
+            # fallback: 카테고리가 포함된 모든 시트 시도
+            new_sheets = [s for s in sheet_names if "카테고리" in s]
+
+        cat_to_type: dict = {}
+
+        # 신형식 우선 로드
+        for sh in new_sheets:
+            partial = _read_cat_sheet(mapping_file, sh)
+            cat_to_type.update(partial)
+            log.info(f"  신형식 시트 [{sh}]: {len(partial)}개 로드")
+
+        # 구형식은 신형식에 없는 카테고리만 보완
+        for sh in old_sheets:
+            partial = _read_cat_sheet(mapping_file, sh)
+            added = {k: v for k, v in partial.items() if k not in cat_to_type}
+            cat_to_type.update(added)
+            log.info(f"  구형식 시트 [{sh}]: {len(partial)}개 중 {len(added)}개 보완")
+
+        if not cat_to_type:
+            log.warning(f"{mapping_file.name}: 카테고리 데이터를 읽지 못함 "
+                        f"(시트: {sheet_names})")
+            return {}
+
+        n_t = sum(1 for v in cat_to_type.values() if v == "통신")
+        n_g = sum(1 for v in cat_to_type.values() if v == "일반")
+        n_u = sum(1 for v in cat_to_type.values() if v == "미분류")
+        log.info(f"통신/일반 매핑 완료: 총 {len(cat_to_type)}개 카테고리 "
+                 f"(통신 {n_t}개 / 일반 {n_g}개 / 미분류 {n_u}개)")
+        return cat_to_type
+
+    except Exception as e:
+        log.warning(f"{mapping_file.name} 로드 실패 → 통신/일반 구분 건너뜀: {e}")
+        return {}
 
 def _is_data_file(p: Path) -> bool:
     # ~$ 접두어 = Excel 임시 잠금 파일
     if p.name.startswith("~$"):
         return False
     name_lower = p.name.lower()
-    return not any(kw in name_lower for kw in EXCLUDE_KEYWORDS) \
-           and p.name != "demand_forecast.py"
+    # EXCLUDE_KEYWORDS 포함 파일 제외
+    if any(kw in name_lower for kw in EXCLUDE_KEYWORDS):
+        return False
+    # 카테고리-담당자 매핑 파일 제외 (키워드 전부 포함 시)
+    if all(kw in p.name for kw in _CATEGORY_FILE_KEYWORDS):
+        return False
+    return p.name != "demand_forecast.py"
 
 def find_input_files() -> list[Path]:
     """현재 폴더에서 분석 대상 데이터 파일 전체 탐지, 연도순 정렬"""
@@ -314,7 +666,8 @@ def find_input_files() -> list[Path]:
 
 COLUMN_ALIASES = {
     # ── 필수 ──────────────────────────────────────────────────────────────
-    "date":      ["정산일자", "입고일자", "입고일", "주문일자", "주문일시", "주문일",
+    "date":      ["발주일자", "주문일자", "주문일시", "주문일",   # 발주일자 최우선
+                  "정산일자", "입고일자", "입고일",
                   "정산확정일", "일일정산월", "일일정산일", "날짜", "일자", "date"],
     "amount":    ["판매금액", "정산금액", "주문금액", "매출액", "금액", "revenue", "amount"],
     "qty":       ["정산수량", "입고수량", "수량", "주문수량", "qty", "quantity"],
@@ -326,6 +679,7 @@ COLUMN_ALIASES = {
     "cost":      ["매입금액", "매입금액(원)", "purchase_amount"],       # 마진 분석
     "lt_order":  ["주문시배송리드타임", "주문리드타임", "order_lead_time"],  # 리드타임 실측
     "lt_std":    ["상품배송리드타임", "표준납기일", "standard_lead_time"],  # 표준 리드타임
+    "settle_date":["정산일자", "정산확정일", "settlement_date"],         # 매출 기준일 (정산)
     "cancel_qty":["취소수량", "cancel_qty"],                            # 실수요 보정
     "return_qty":["반품수량", "return_qty"],                            # 실수요 보정
     "order_date":["주문일자", "주문일시", "order_date"],                 # LT 실측 계산용
@@ -383,6 +737,16 @@ def _read_excel_safe(filepath: Path, **kwargs) -> dict:
         raise
 
 
+CHANNELS = ["KT", "그룹사", "외부사", "지입자재"]
+
+def _extract_channel(filename: str) -> str:
+    """파일명에서 채널 추출 (KT/그룹사/외부사/지입자재)"""
+    for ch in CHANNELS:
+        if ch in filename:
+            return ch
+    return "기타"
+
+
 def _read_single_file(filepath: Path) -> pd.DataFrame:
     """단일 파일(xlsx/xls/csv) → DataFrame. 멀티시트는 전부 합친다."""
     if filepath.suffix.lower() == ".csv":
@@ -404,12 +768,58 @@ def _read_single_file(filepath: Path) -> pd.DataFrame:
 
 def load_and_preprocess(filepaths: list[Path], col_map: dict, lead_time: int):
     """복수 파일을 읽어 하나의 DataFrame으로 병합 후 전처리"""
+
+    # ── 파일 레벨 skip 키워드 (트랜잭션 데이터 아닌 참조/매핑 파일) ──────
+    _SKIP_KEYWORDS = ["카테고리목록", "미분류", "담당자", "mapping_master"]
+
     all_frames = []
     for fp in filepaths:
+        # 비데이터 파일 skip
+        if any(kw in fp.name for kw in _SKIP_KEYWORDS):
+            log.info(f"파일 skip (비데이터): {fp.name}")
+            continue
+
         log.info(f"파일 로드: {fp.name}")
         try:
             raw = _read_single_file(fp)
             raw.columns = raw.columns.str.strip()
+
+            # ── 컬럼 목록 로그 기록 ─────────────────────────────────────
+            log.info(f"  컬럼 목록 ({len(raw.columns)}개): {list(raw.columns)}")
+
+            # ── 정산현황 파일 호환 처리 ───────────────────────────────────
+            # 발주일자가 없으면 정산현황 파일로 간주 → 정산일자를 _date 대용으로 주입
+            date_col = col_map.get("date", "발주일자")
+            if date_col not in raw.columns:
+                # 정산일자 후보 컬럼 탐색
+                _settle_candidates = ["정산일자", "정산확정일", "일일정산일", "일일정산월"]
+                _fallback_date = next(
+                    (c for c in _settle_candidates if c in raw.columns), None
+                )
+                if _fallback_date:
+                    log.info(f"  '{date_col}' 없음 → '{_fallback_date}'를 발주일자 대용으로 사용 "
+                             f"({fp.name})")
+                    raw[date_col] = raw[_fallback_date]
+                else:
+                    log.warning(f"  날짜 컬럼({date_col}) 및 정산일자 모두 없음 → skip ({fp.name})")
+                    log.warning(f"  사용 가능한 컬럼: {list(raw.columns)}")
+                    continue
+
+            # ── 금액 컬럼 없으면 skip ────────────────────────────────────
+            amount_col = col_map.get("amount", "판매금액")
+            if amount_col not in raw.columns:
+                _amount_candidates = ["정산금액", "매출액", "금액", "판매금액"]
+                _fallback_amt = next(
+                    (c for c in _amount_candidates if c in raw.columns), None
+                )
+                if _fallback_amt:
+                    log.info(f"  '{amount_col}' 없음 → '{_fallback_amt}'를 금액 대용으로 사용 "
+                             f"({fp.name})")
+                    raw[amount_col] = raw[_fallback_amt]
+                else:
+                    log.warning(f"  금액 컬럼({amount_col}) 없음 → skip ({fp.name})")
+                    continue
+
             raw["_source_file"] = fp.name   # 출처 파일 추적용
             all_frames.append(raw)
             log.info(f"  → {len(raw):,}행 읽음")
@@ -427,6 +837,58 @@ def load_and_preprocess(filepaths: list[Path], col_map: dict, lead_time: int):
     # 날짜
     date_col = col_map["date"]
     df["_date"] = pd.to_datetime(df[date_col], errors="coerce")
+
+    # ── 숫자형 날짜 감지 & 재변환 ────────────────────────────────────────
+    # pd.to_datetime(숫자) 는 기본적으로 나노초로 해석 → 1970-01-01 오파싱
+    # 파싱 후 날짜가 1970년 근방이면 숫자형 날짜로 판단해 형식 자동 감지
+    valid_dates = df["_date"].dropna()
+    if len(valid_dates) > 0 and valid_dates.dt.year.between(1969, 1972).mean() > 0.5:
+        numeric = pd.to_numeric(df[date_col], errors="coerce")
+        num_valid = numeric.dropna()
+
+        if len(num_valid) > 0:
+            med = float(num_valid.median())
+
+            if 20_000_101 <= med <= 20_991_231:
+                # YYYYMMDD 정수 예: 20221001 → 2022-10-01
+                log.warning(f"날짜 컬럼({date_col}) YYYYMMDD 정수 감지(중앙값={med:.0f}) → 재변환")
+                df["_date"] = pd.to_datetime(
+                    numeric.astype("Int64").astype(str).str.zfill(8),
+                    format="%Y%m%d", errors="coerce"
+                )
+
+            elif 30_000 <= med <= 80_000:
+                # Excel 시리얼 (일 단위, 1899-12-30 기준) 예: 43831 → 2020-01-06
+                log.warning(f"날짜 컬럼({date_col}) Excel 시리얼(일) 감지(중앙값={med:.0f}) → 재변환")
+                df["_date"] = pd.to_datetime(numeric, unit="D",
+                                              origin="1899-12-30", errors="coerce")
+
+            elif 900_000_000_000 <= med <= 2_000_000_000_000:
+                # Unix 밀리초 타임스탬프 예: 1580947200000 → 2020-02-06
+                log.warning(f"날짜 컬럼({date_col}) Unix ms 타임스탬프 감지(중앙값={med:.0f}) → 재변환")
+                df["_date"] = pd.to_datetime(numeric, unit="ms", errors="coerce")
+
+            elif 900_000_000 <= med <= 2_000_000_000:
+                # Unix 초 타임스탬프 예: 1580947200 → 2020-02-06
+                log.warning(f"날짜 컬럼({date_col}) Unix 초 타임스탬프 감지(중앙값={med:.0f}) → 재변환")
+                df["_date"] = pd.to_datetime(numeric, unit="s", errors="coerce")
+
+            else:
+                # 마지막 수단: 문자열로 변환 후 여러 포맷 시도
+                log.warning(f"날짜 컬럼({date_col}) 형식 미감지(중앙값={med:.0f}) → 문자열 포맷 시도")
+                s = df[date_col].astype(str).str.strip()
+                for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y"):
+                    parsed = pd.to_datetime(s, format=fmt, errors="coerce")
+                    if parsed.notna().mean() > 0.5:
+                        df["_date"] = parsed
+                        break
+                else:
+                    df["_date"] = pd.to_datetime(s, errors="coerce")
+
+            converted = df["_date"].notna().sum()
+            sample_yr  = df["_date"].dropna().dt.year.value_counts().head(3).to_dict()
+            log.info(f"  → 날짜 재변환: {converted:,}건 성공, 연도 분포: {sample_yr}")
+
     if df["_date"].isna().all():
         def parse_kor(s):
             try:
@@ -435,8 +897,41 @@ def load_and_preprocess(filepaths: list[Path], col_map: dict, lead_time: int):
             except Exception:
                 return pd.NaT
         df["_date"] = df[date_col].apply(parse_kor)
+
     df.dropna(subset=["_date"], inplace=True)
     df["_ym"] = df["_date"].dt.to_period("M")
+
+    # ── 당월(불완전) 데이터 제외 ─────────────────────────────────────────
+    # 오늘 기준 현재 월은 데이터가 불완전 → 훈련 제외, 예측 대상으로 전환
+    current_ym = pd.Period(datetime.now(), freq="M")
+    before_cut = len(df)
+    df = df.loc[df["_ym"] < current_ym].reset_index(drop=True)
+    cut_rows = before_cut - len(df)
+    if cut_rows > 0:
+        log.info(f"  당월({current_ym}) 불완전 데이터 제외: {cut_rows:,}행 "
+                 f"(예측 대상으로 전환)")
+
+    # ── 정산일자 → _settle_ym (매출 기준) ───────────────────────────────
+    if col_map.get("settle_date") and col_map["settle_date"] != date_col:
+        raw_settle = df[col_map["settle_date"]]
+        settle_dt  = pd.to_datetime(raw_settle, errors="coerce")
+        # YYYYMMDD 정수 감지
+        valid_s = settle_dt.dropna()
+        if len(valid_s) > 0 and valid_s.dt.year.between(1969, 1972).mean() > 0.5:
+            num_s = pd.to_numeric(raw_settle, errors="coerce")
+            med_s = float(num_s.dropna().median()) if len(num_s.dropna()) > 0 else 0
+            if 20_000_101 <= med_s <= 20_991_231:
+                settle_dt = pd.to_datetime(
+                    num_s.astype("Int64").astype(str).str.zfill(8),
+                    format="%Y%m%d", errors="coerce")
+        df["_settle_ym"] = settle_dt.dt.to_period("M")
+        # 당월 이후 정산 데이터는 미래 정산 → 유지 (예측 목적)
+        # 단, 과거 발주 중 당월 이후 정산 예정인 것도 포함
+        log.info(f"  정산일 기준 기간: "
+                 f"{df['_settle_ym'].dropna().min()} ~ "
+                 f"{df['_settle_ym'].dropna().max()}")
+    else:
+        df["_settle_ym"] = df["_ym"]   # fallback: 발주일과 동일
 
     # 중복 제거 (동일 날짜+금액+수량 행이 여러 파일에 걸쳐 중복될 경우)
     key_cols = [date_col, col_map["amount"]]
@@ -461,6 +956,31 @@ def load_and_preprocess(filepaths: list[Path], col_map: dict, lead_time: int):
         df["_prod_key"] = cat.str[:20] + "|" + pn.str[:20]
 
     df["_vendor"] = df[col_map["vendor"]].astype(str).str.strip() if col_map.get("vendor") else "미분류"
+
+    # ── 통신/일반 구분 (mapping_master.xlsx 기반) ────────────────────────
+    prod_type_map = load_prod_type_map()
+    if prod_type_map and col_map.get("category"):
+        cat_series = df[col_map["category"]].astype(str).str.strip()
+        # 1단계: 정확 매핑
+        df["_prod_type"] = cat_series.map(prod_type_map).fillna("미분류")
+        # 2단계: 미분류 → 마지막 키워드 추론
+        n_miss = (df["_prod_type"] == "미분류").sum()
+        if n_miss > 0:
+            rightmost_map = _build_rightmost_map(prod_type_map)
+            miss_mask = df["_prod_type"] == "미분류"
+            rightmost_s = cat_series[miss_mask].str.split(">").str[-1].str.strip()
+            df.loc[miss_mask, "_prod_type"] = rightmost_s.map(rightmost_map).fillna("미분류")
+        n_t = (df["_prod_type"] == "통신").sum()
+        n_g = (df["_prod_type"] == "일반").sum()
+        n_u = (df["_prod_type"] == "미분류").sum()
+        log.info(f"  통신/일반 구분: 통신 {n_t:,}행 / 일반 {n_g:,}행 / 미분류 {n_u:,}행")
+    else:
+        df["_prod_type"] = "미분류"
+        if not prod_type_map:
+            log.info("  통신/일반 구분: 매핑 파일 없음 → 전체 미분류")
+
+    # ── 채널 추출 (파일명 기반: KT/그룹사/외부사/지입자재) ───────────────
+    df["_channel"] = df["_source_file"].apply(_extract_channel)
 
     # ── 실수요 보정: 취소·반품 차감 ──────────────────────────────────────
     if col_map.get("cancel_qty"):
@@ -501,18 +1021,25 @@ def load_and_preprocess(filepaths: list[Path], col_map: dict, lead_time: int):
     return df
 
 
-def build_monthly_series(df: pd.DataFrame, group_cols=None) -> pd.DataFrame:
-    """group_cols=None → 전체 집계, list → 그룹별"""
+def build_monthly_series(df: pd.DataFrame, group_cols=None,
+                         ym_col: str = "_ym") -> pd.DataFrame:
+    """
+    group_cols=None → 전체 집계, list → 그룹별
+    ym_col: 집계 기준 연월 컬럼 (_ym=발주일 기준, _settle_ym=정산일 기준)
+    """
+    valid = df[df[ym_col].notna()].copy()
     if group_cols:
-        grp = df.groupby(group_cols + ["_ym"]).agg(
+        grp = valid.groupby(group_cols + [ym_col]).agg(
             amount=("_amount", "sum"),
             qty=("_qty", "sum"),
         ).reset_index()
+        grp.rename(columns={ym_col: "_ym"}, inplace=True)
     else:
-        grp = df.groupby("_ym").agg(
+        grp = valid.groupby(ym_col).agg(
             amount=("_amount", "sum"),
             qty=("_qty", "sum"),
         ).reset_index()
+        grp.rename(columns={ym_col: "_ym"}, inplace=True)
     return grp
 
 
@@ -558,9 +1085,12 @@ def classify_abc_cv(group_df: pd.DataFrame) -> pd.DataFrame:
     group_df: vendor × prod_key 기준 월별 집계 롱포맷
     반환: 분류 결과 DataFrame
     """
-    # 그룹별 총 금액
+    # 그룹별 총 금액 (채널 정보 포함)
+    grp_cols = ["_vendor", "_prod_key"]
+    if "_channel" in group_df.columns:
+        grp_cols = ["_channel", "_vendor", "_prod_key"]
     summary = (
-        group_df.groupby(["_vendor", "_prod_key"])
+        group_df.groupby(grp_cols)
         .agg(total_amount=("amount", "sum"),
              mean_qty=("qty", "mean"),
              std_qty=("qty", "std"),
@@ -607,17 +1137,35 @@ def classify_abc_cv(group_df: pd.DataFrame) -> pd.DataFrame:
 # 4. 예측 모델
 # ════════════════════════════════════════════════════════════════════════════
 def _mape(actual, pred):
-    actual, pred = np.array(actual), np.array(pred)
-    mask = actual != 0
+    actual, pred = np.array(actual, dtype=float), np.array(pred, dtype=float)
+    mask = np.abs(actual) > 1e-6   # 극소값 제외 (0원에 가까운 실적은 % 오차 무의미)
     if mask.sum() == 0:
         return np.nan
-    return np.mean(np.abs((actual[mask] - pred[mask]) / actual[mask])) * 100
+    pct_errors = np.abs((actual[mask] - pred[mask]) / actual[mask]) * 100
+    pct_errors = np.clip(pct_errors, 0, 300)   # 개별 오차 최대 300% 캡핑
+    return float(np.mean(pct_errors))
 
 def _mae(actual, pred):
     return np.mean(np.abs(np.array(actual) - np.array(pred)))
 
 def _rmse(actual, pred):
     return np.sqrt(np.mean((np.array(actual) - np.array(pred))**2))
+
+def _tracking_signal(actual, pred):
+    """
+    Tracking Signal = 대수합(오차) / MAD
+    CPSM Module 2 Ch.3 기준:
+      TS > +4 : 지속 과소예측 (수요 > 예측) → 재고 부족 위험
+      TS < -4 : 지속 과대예측 (수요 < 예측) → 재고 과잉 위험
+      -4 ≤ TS ≤ +4 : 예측 편향 없음 (정상)
+    """
+    actual, pred = np.array(actual, dtype=float), np.array(pred, dtype=float)
+    errors = actual - pred          # A - F (양수 = 과소예측)
+    algebraic_sum = np.sum(errors)
+    mad = np.mean(np.abs(errors))
+    if mad == 0:
+        return np.nan
+    return algebraic_sum / mad
 
 
 def model_holt_winters(train: np.ndarray, h: int):
@@ -784,9 +1332,9 @@ def forecast_series(series: np.ndarray, best_model: str, h=6):
         elif best_model == "SARIMA":
             res = model_sarima(series, h)
             fc, rs = res[0], res[1]
-            ci = res[2]
-            ci_lo = ci.iloc[:, 0].values
-            ci_hi = ci.iloc[:, 1].values
+            ci = np.array(res[2])   # DataFrame or ndarray 모두 처리
+            ci_lo = ci[:, 0]
+            ci_hi = ci[:, 1]
         else:
             fc, rs = model_ma3(series, h)
     except Exception as e:
@@ -803,7 +1351,14 @@ def forecast_series(series: np.ndarray, best_model: str, h=6):
 # ════════════════════════════════════════════════════════════════════════════
 # 6. CPSM 지표
 # ════════════════════════════════════════════════════════════════════════════
-DEFAULT_LEAD_TIME = 30   # 리드타임 파일에 없는 품목의 기본값 (일)
+DEFAULT_LEAD_TIME  = 30   # 리드타임 파일에 없는 품목의 기본값 (일)
+SETTLE_LAG_MONTHS  = 1    # 정산 지연 개월 수 (당월+N개월 전까지만 정산 완성으로 간주)
+                          # 예: 1 → 5월말 기준으로 4월까지만 완성, 5·6월은 예측 대상
+                          # 매월 정산이 익월 말까지 완료되면 1, 2개월 후면 2로 설정
+ORDER_LAG_MONTHS   = 1    # 발주일 기준 데이터 완성 지연 개월 수
+                          # 월말 마감 전 입력 지연으로 전월도 불완전할 수 있음
+                          # 예: 1 → 6월 실행 시 5월 데이터는 훈련 제외, 예측 대상으로 전환
+                          # 0으로 설정하면 당월만 제외 (기존 동작)
 
 def build_lt_stats(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1005,6 +1560,7 @@ def write_sheet1_overall(wb, overall_actual: pd.DataFrame, fc_vals, ci_lo, ci_hi
 
     # 실제값 행
     r = SR + 1
+    last_actual_amount = None
     for _, row in overall_actual.iterrows():
         bg = C_ACTUAL
         dcell(ws.cell(r, 1), str(row["_ym"]), align="center", bg=bg)
@@ -1015,14 +1571,17 @@ def write_sheet1_overall(wb, overall_actual: pd.DataFrame, fc_vals, ci_lo, ci_hi
         dcell(ws.cell(r, 6), None, bg=bg)
         dcell(ws.cell(r, 7), best_model, align="center", bg=bg)
         dcell(ws.cell(r, 8), None, bg=bg)
+        last_actual_amount = row["amount"]
         r += 1
 
-    # 예측값 행
+    # 예측값 행 (첫 번째 예측 행에 마지막 실적값도 기입 → 차트 선이 연결됨)
     for i, period in enumerate(future_periods):
         bg = C_FCST
         warn_bg = C_WARN if model_mape > 30 else C_FCST
         dcell(ws.cell(r, 1), str(period),   align="center", bg=bg)
-        dcell(ws.cell(r, 2), None, bg=bg)
+        # 첫 번째 예측 행: 실적 컬럼에 마지막 실적값 기입 (차트 연결용 브릿지 포인트)
+        bridge = last_actual_amount if (i == 0 and last_actual_amount is not None) else None
+        dcell(ws.cell(r, 2), bridge, NUM_FMT, bg=bg)
         dcell(ws.cell(r, 3), None, bg=bg)
         dcell(ws.cell(r, 4), float(fc_vals[i]),  NUM_FMT, bg=bg)
         dcell(ws.cell(r, 5), float(ci_lo[i]),    NUM_FMT, bg=bg)
@@ -1035,6 +1594,7 @@ def write_sheet1_overall(wb, overall_actual: pd.DataFrame, fc_vals, ci_lo, ci_hi
     for c, w in enumerate([14,20,16,20,20,20,16,12], 1):
         cw(ws, c, w)
     ws.freeze_panes = f"A{SR+1}"
+    ws.auto_filter.ref = f"A{SR}:H{r-1}"
 
     # 차트
     n_total = len(overall_actual) + len(future_periods)
@@ -1051,17 +1611,21 @@ def write_sheet2_abc(wb, abc_df: pd.DataFrame, ss_rop: dict):
     ws = wb.create_sheet("ABC_CV_분류표")
     sheet_title(ws, "ABC × CV 분류표 (CPSM 공급망 분석)")
     SR = 4
-    headers = ["협력사명", "상품코드", "ABC등급", "CV값", "CV구분",
+    has_channel = "_channel" in abc_df.columns
+    headers = (["채널"] if has_channel else []) + \
+              ["협력사명", "상품코드", "ABC등급", "CV값", "CV구분",
                "연간정산금액(원)", "누적기여율(%)", "예측전략",
                "LT평균(일)", "LT표준편차(일)", "안전재고공식", "안전재고(수량)", "ROP(수량)"]
     for c, h in enumerate(headers, 1):
         hcell(ws.cell(SR, c), h)
     ws.row_dimensions[SR].height = 30
 
-    for r, row in enumerate(abc_df.itertuples(), SR+1):
-        abc = row.ABC
+    ch_colors = {"KT": "DDEEFF", "그룹사": "DDF0DD", "외부사": "FFF0CC", "지입자재": "FFE0E0"}
+
+    for r, (_, row) in enumerate(abc_df.iterrows(), SR+1):
+        abc = row["ABC"]
         bg = C_A if abc == "A" else (C_B if abc == "B" else None)
-        key = (row._vendor, row._prod_key)
+        key = (row["_vendor"], row["_prod_key"])
         d       = ss_rop.get(key, {})
         ss_val  = d.get("ss", 0)
         rop_val = d.get("rop", 0)
@@ -1069,27 +1633,38 @@ def write_sheet2_abc(wb, abc_df: pd.DataFrame, ss_rop: dict):
         lt_s    = d.get("lt_std", 0)
         formula = d.get("formula", "-")
 
-        dcell(ws.cell(r, 1), row._vendor,    align="left", bg=bg)
-        dcell(ws.cell(r, 2), row._prod_key,  align="left", bg=bg)
-        dcell(ws.cell(r, 3), abc, align="center", bg=bg, bold=True)
-        dcell(ws.cell(r, 4), round(row.cv, 3), "0.000", bg=bg)
-        dcell(ws.cell(r, 5), row.CV_class, align="center", bg=bg)
-        dcell(ws.cell(r, 6), row.total_amount, NUM_FMT, bg=bg)
-        dcell(ws.cell(r, 7), round(row.cum_pct, 2), "0.00%", bg=bg)
-        dcell(ws.cell(r, 8), row.strategy, align="center", bg=bg)
+        col = 1
+        if has_channel:
+            ch = str(row.get("_channel", "기타"))
+            ch_bg = ch_colors.get(ch, "F0F0F0") if bg is None else bg
+            dcell(ws.cell(r, col), ch, align="center", bg=ch_bg, bold=True)
+            col += 1
+
+        dcell(ws.cell(r, col),   str(row["_vendor"]),   align="left", bg=bg); col += 1
+        dcell(ws.cell(r, col),   str(row["_prod_key"]), align="left", bg=bg); col += 1
+        dcell(ws.cell(r, col),   abc, align="center", bg=bg, bold=True);      col += 1
+        dcell(ws.cell(r, col),   round(row["cv"], 3), "0.000", bg=bg);        col += 1
+        dcell(ws.cell(r, col),   row["CV_class"], align="center", bg=bg);     col += 1
+        dcell(ws.cell(r, col),   row["total_amount"], NUM_FMT, bg=bg);        col += 1
+        dcell(ws.cell(r, col),   round(row["cum_pct"], 2), "0.00%", bg=bg);   col += 1
+        dcell(ws.cell(r, col),   row["strategy"], align="center", bg=bg);     col += 1
         # LT평균 — 기본값이면 연한 노란 배경
         lt_bg = "FFF9C4" if abs(lt_val - DEFAULT_LEAD_TIME) < 0.1 and lt_s == 0 else bg
-        dcell(ws.cell(r, 9),  round(lt_val, 1), "0.0", bg=lt_bg)
-        dcell(ws.cell(r, 10), round(lt_s, 1),   "0.0",
-              bg="E8F5E9" if lt_s > 0 else bg)   # 연두 = 실측 변동성 반영
-        dcell(ws.cell(r, 11), formula, align="center",
-              bg="E8F5E9" if "완전" in formula else bg)
-        dcell(ws.cell(r, 12), round(ss_val, 1),  "0.0", bg=bg)
-        dcell(ws.cell(r, 13), round(rop_val, 1), "0.0", bg=bg)
+        dcell(ws.cell(r, col),   round(lt_val, 1), "0.0", bg=lt_bg);              col += 1
+        dcell(ws.cell(r, col),   round(lt_s, 1),   "0.0",
+              bg="E8F5E9" if lt_s > 0 else bg);                                   col += 1
+        dcell(ws.cell(r, col),   formula, align="center",
+              bg="E8F5E9" if "완전" in formula else bg);                           col += 1
+        dcell(ws.cell(r, col),   round(ss_val, 1),  "0.0", bg=bg);               col += 1
+        dcell(ws.cell(r, col),   round(rop_val, 1), "0.0", bg=bg)
 
-    for c, w in enumerate([22, 28, 10, 10, 12, 20, 14, 14, 12, 14, 18, 14, 14], 1):
+    ch_w = [10] if has_channel else []
+    n_cols = len(ch_w) + 14
+    for c, w in enumerate(ch_w + [22, 28, 10, 10, 12, 20, 14, 14, 12, 14, 18, 14, 14], 1):
         cw(ws, c, w)
     ws.freeze_panes = f"A{SR+1}"
+    from openpyxl.utils import get_column_letter
+    ws.auto_filter.ref = f"A{SR}:{get_column_letter(n_cols)}{r-1}"
 
 
 def write_sheet3_detail(wb, detail_rows: list):
@@ -1126,6 +1701,526 @@ def write_sheet3_detail(wb, detail_rows: list):
     for c, w in enumerate([22,28,10,18,16,16,16,16,16,16,14,12,12], 1):
         cw(ws, c, w)
     ws.freeze_panes = f"A{SR+1}"
+    ws.auto_filter.ref = f"A{SR}:M{r-1}"
+
+
+def write_sheet_forecast_detail(wb, detail_rows: list, ss_rop: dict):
+    """
+    Sheet: 예측근거_상품분석
+    상품별 예측값, 모델, 정확도, 안전재고 종합 분석
+    """
+    ws = wb.create_sheet("예측근거_상품분석")
+    sheet_title(ws, "상품별 예측 분석 근거",
+                "A등급 전체 + B등급 상위 20개 품목의 예측 모델 및 안전재고 정보")
+
+    # 헤더 설정 (18개 컬럼)
+    SR = 3
+    headers = [
+        "협력사", "상품코드", "ABC", "통신/일반", "최근12개월\n월평균(원)",   # avg12 = 월평균
+        "6개월누적예측(원)",
+        "예측+1M", "예측+2M", "예측+3M", "예측+4M", "예측+5M", "예측+6M",
+        "예측모델", "MAPE(%)", "신뢰도", "안전재고(개)", "ROP(개)", "리드타임(일)"
+    ]
+
+    for c, h in enumerate(headers, 1):
+        hcell(ws.cell(SR, c), h, bg=C_HEADER)
+    ws.row_dimensions[SR].height = 28
+
+    # 데이터 행
+    r = SR + 1
+    for dr in detail_rows:
+        vendor = dr["vendor"]
+        prod_key = dr["prod_key"]
+
+        # ss_rop에서 해당 상품의 값 조회
+        ss_rop_key = (vendor, prod_key)
+        ss_rop_info = ss_rop.get(ss_rop_key, {})
+
+        # ABC 등급별 배경색
+        abc = dr["ABC"]
+        abc_bg = C_A if abc == "A" else (C_B if abc == "B" else C_C)
+
+        # MAPE 기반 신뢰도 플래그 (3단계)
+        mape_val = dr.get("mape", np.nan)
+        if np.isnan(mape_val):
+            trust_flag = "불확정"
+            trust_color = "F0F0F0"
+        elif mape_val <= 15:
+            trust_flag = "●"  # 높음
+            trust_color = "BDD7EE"
+        elif mape_val <= 30:
+            trust_flag = "◐"  # 중간
+            trust_color = "FFE699"
+        else:
+            trust_flag = "◯"  # 낮음
+            trust_color = "F8CBAD"
+
+        # 협력사
+        dcell(ws.cell(r, 1), vendor)
+        # 상품코드
+        dcell(ws.cell(r, 2), prod_key)
+        # ABC
+        dcell(ws.cell(r, 3), abc, align="center", bold=True, bg=abc_bg)
+        # 통신/일반 구분 (col 4)
+        prod_type = dr.get("prod_type", "미분류")
+        pt_bg = "D6E4F7" if prod_type == "통신" else ("E8F5E9" if prod_type == "일반" else "F5F5F5")
+        dcell(ws.cell(r, 4), prod_type, align="center", bold=True, bg=pt_bg)
+        # 최근12개월 평균 (col 5)
+        dcell(ws.cell(r, 5), dr["avg12"], NUM_FMT)
+        # 6개월 누적 (col 6)
+        fc6_sum = float(np.sum(dr["fc6"]))
+        dcell(ws.cell(r, 6), fc6_sum, NUM_FMT, bold=True, bg=C_FCST)
+
+        # 6개월 개별 예측값 (col 7~12)
+        for i, fc_v in enumerate(dr["fc6"], 7):
+            dcell(ws.cell(r, i), float(fc_v), NUM_FMT, bg=C_FCST)
+
+        # 예측 모델명 (col 13)
+        dcell(ws.cell(r, 13), dr["model"], align="center")
+        # MAPE (%) (col 14)
+        mape_str = f"{mape_val:.1f}" if not np.isnan(mape_val) else "N/A"
+        dcell(ws.cell(r, 14), mape_str, align="center")
+        # 신뢰도 (col 15)
+        dcell(ws.cell(r, 15), trust_flag, align="center", bold=True, bg=trust_color)
+        # 안전재고 (col 16)
+        ss_val = ss_rop_info.get("ss", 0)
+        dcell(ws.cell(r, 16), round(ss_val) if ss_val > 0 else "", NUM_FMT)
+        # ROP (col 17)
+        rop_val = ss_rop_info.get("rop", 0)
+        dcell(ws.cell(r, 17), round(rop_val) if rop_val > 0 else "", NUM_FMT)
+        # 리드타임 (col 18)
+        lt_val = ss_rop_info.get("lead_time", DEFAULT_LEAD_TIME)
+        dcell(ws.cell(r, 18), f"{lt_val:.0f}", align="center")
+
+        r += 1
+
+    # 컬럼 너비 설정 (18개 컬럼: 통신/일반 추가)
+    widths = [16, 20, 8, 10, 18, 18, 12, 12, 12, 12, 12, 12, 16, 12, 10, 14, 14, 12]
+    for c, w in enumerate(widths, 1):
+        cw(ws, c, w)
+
+    # 고정행 및 포맷팅
+    ws.freeze_panes = f"A{SR+1}"
+    ws.auto_filter.ref = f"A{SR}:R{r-1}"
+    ws.sheet_view.showGridLines = False
+
+
+def write_sheet_tracking_signal(wb, detail_rows: list):
+    """
+    Tracking Signal 분석 시트 (CPSM Module 2 Ch.3 기준)
+    TS > +4 : 지속 과소예측 → 재고부족 위험
+    TS < -4 : 지속 과대예측 → 재고과잉 위험
+    """
+    ws = wb.create_sheet("예측편향_TrackingSignal")
+    sheet_title(ws, "Tracking Signal 분석 — 예측 편향 감지",
+                "CPSM 기준: |TS| > 4 이면 예측 편향 경보 | TS > 0: 과소예측(재고부족) | TS < 0: 과대예측(재고과잉)")
+
+    SR = 3
+    headers = ["협력사", "상품코드", "통신/일반", "ABC",
+               "Tracking Signal", "판정", "MAPE(%)", "예측모델",
+               "최근12개월평균(원)", "6개월누적예측(원)"]
+    h_colors = {"Tracking Signal": "1F4E79", "판정": "1F4E79"}
+    for c, h in enumerate(headers, 1):
+        bg = h_colors.get(h, C_HEADER)
+        hcell(ws.cell(SR, c), h, bg=bg)
+    ws.row_dimensions[SR].height = 28
+
+    # Tracking Signal 값으로 정렬 (절댓값 큰 순 — 위험 품목 상단)
+    rows_sorted = sorted(
+        [dr for dr in detail_rows if not np.isnan(dr.get("tracking_signal", np.nan))],
+        key=lambda d: abs(d.get("tracking_signal", 0)), reverse=True
+    ) + [dr for dr in detail_rows if np.isnan(dr.get("tracking_signal", np.nan))]
+
+    r = SR + 1
+    for dr in rows_sorted:
+        ts = dr.get("tracking_signal", np.nan)
+        mape = dr.get("mape", np.nan)
+        abc  = dr["ABC"]
+
+        # 판정 및 색상
+        if np.isnan(ts):
+            verdict, ts_bg, row_bg = "데이터부족", "F0F0F0", None
+        elif ts > 4:
+            verdict, ts_bg, row_bg = "⚠ 과소예측(재고부족)", "FF9999", "FFF0F0"
+        elif ts < -4:
+            verdict, ts_bg, row_bg = "⚠ 과대예측(재고과잉)", "FFD966", "FFFBEA"
+        else:
+            verdict, ts_bg, row_bg = "✓ 정상", "C6EFCE", None
+
+        abc_bg = C_A if abc == "A" else (C_B if abc == "B" else "F0F0F0")
+        pt     = dr.get("prod_type", "미분류")
+        pt_bg  = "D6E4F7" if pt == "통신" else ("E8F5E9" if pt == "일반" else "F5F5F5")
+
+        if row_bg:
+            for c in range(1, len(headers) + 1):
+                ws.cell(r, c).fill = PatternFill("solid", start_color=row_bg)
+
+        dcell(ws.cell(r, 1), dr["vendor"])
+        dcell(ws.cell(r, 2), dr["prod_key"])
+        dcell(ws.cell(r, 3), pt, align="center", bold=True, bg=pt_bg)
+        dcell(ws.cell(r, 4), abc, align="center", bold=True, bg=abc_bg)
+        ts_str = f"{ts:+.2f}" if not np.isnan(ts) else "N/A"
+        dcell(ws.cell(r, 5), ts_str, align="center", bold=True, bg=ts_bg)
+        dcell(ws.cell(r, 6), verdict, align="center", bg=ts_bg)
+        mape_str = f"{mape:.1f}%" if not np.isnan(mape) else "N/A"
+        dcell(ws.cell(r, 7), mape_str, align="center")
+        dcell(ws.cell(r, 8), dr["model"], align="center")
+        dcell(ws.cell(r, 9), dr["avg12"], NUM_FMT)
+        dcell(ws.cell(r, 10), float(np.sum(dr["fc6"])), NUM_FMT)
+        r += 1
+
+    # 범례
+    ws.cell(r + 1, 1, "【Tracking Signal 해석】")
+    ws.cell(r + 1, 1).font = Font(name=FONT_NAME, bold=True, size=9)
+    ws.cell(r + 2, 1, "TS > +4 : 과소예측 지속 — 실제수요가 예측보다 높음 → 발주량/안전재고 상향 검토")
+    ws.cell(r + 3, 1, "TS < -4 : 과대예측 지속 — 실제수요가 예측보다 낮음 → 발주량 축소, 재고 소진 검토")
+    ws.cell(r + 4, 1, "-4 ≤ TS ≤ +4 : 정상 범위 — 예측 편향 없음")
+    for ri in range(r + 2, r + 5):
+        ws.cell(ri, 1).font = Font(name=FONT_NAME, size=9, color="595959")
+
+    # 통계 요약
+    all_ts = [dr.get("tracking_signal", np.nan) for dr in rows_sorted]
+    valid_ts = [v for v in all_ts if not np.isnan(v)]
+    n_under  = sum(1 for v in valid_ts if v > 4)
+    n_over   = sum(1 for v in valid_ts if v < -4)
+    n_normal = sum(1 for v in valid_ts if -4 <= v <= 4)
+    ws.cell(r + 6, 1, f"전체 {len(valid_ts)}개 품목 분석 결과: "
+                      f"과소예측 {n_under}개 / 과대예측 {n_over}개 / 정상 {n_normal}개")
+    ws.cell(r + 6, 1).font = Font(name=FONT_NAME, bold=True, size=10)
+
+    for c, w in enumerate([20, 28, 10, 8, 16, 22, 12, 16, 20, 20], 1):
+        cw(ws, c, w)
+    ws.freeze_panes = f"A{SR + 1}"
+    ws.auto_filter.ref = f"A{SR}:J{SR + len(rows_sorted)}"
+    ws.sheet_view.showGridLines = False
+
+
+def write_sheet_supplier_risk(wb, df: pd.DataFrame, abc_df: pd.DataFrame):
+    """
+    공급업체 Risk Score 시트 (CPSM Module 1 Ch.1 Risk Analysis 기반)
+    위험 = 납기준수율 × 가격변동성 × 공급집중도 × 품목중요도(ABC)
+    """
+    ws = wb.create_sheet("공급업체_리스크")
+    sheet_title(ws, "공급업체 리스크 스코어링",
+                "CPSM Module 1 Risk Analysis — 납기·가격·집중도·품목중요도 종합 평가")
+
+    # ── 납기준수율 계산 (주문일 → 입고일 실제 vs 기준 LT) ─────────────────
+    has_lt_cols = "_lt" in df.columns and "_date" in df.columns
+    if has_lt_cols:
+        lt_df_calc = (
+            df[df["_lt"].notna() & (df["_lt"] > 0)]
+            .groupby("_vendor")["_lt"]
+            .agg(lt_mean="mean", lt_std="std", lt_n="count")
+            .reset_index()
+        )
+    else:
+        lt_df_calc = pd.DataFrame(columns=["_vendor", "lt_mean", "lt_std", "lt_n"])
+
+    # ── 공급업체별 금액 집계 (최근 12개월) ────────────────────────────────
+    if "_ym" in df.columns:
+        max_ym = df["_ym"].max()
+        recent_mask = df["_ym"] >= (max_ym - 11)
+        recent_df = df[recent_mask].copy()
+    else:
+        recent_df = df.copy()
+
+    vendor_spend = (
+        recent_df.groupby("_vendor")["_amount"]
+        .agg(total_amount="sum", order_count="count")
+        .reset_index()
+    )
+    total_spend = vendor_spend["total_amount"].sum()
+    if total_spend > 0:
+        vendor_spend["spend_share"] = vendor_spend["total_amount"] / total_spend * 100
+    else:
+        vendor_spend["spend_share"] = 0
+
+    # ── 가격변동성 (금액 CV) ──────────────────────────────────────────────
+    if "_ym" in df.columns:
+        price_cv = (
+            recent_df.groupby(["_vendor", "_ym"])["_amount"].sum()
+            .reset_index()
+            .groupby("_vendor")["_amount"]
+            .agg(price_mean="mean", price_std="std")
+            .reset_index()
+        )
+        price_cv["price_cv"] = np.where(
+            price_cv["price_mean"] > 0,
+            price_cv["price_std"] / price_cv["price_mean"] * 100, 0
+        )
+        price_cv["price_cv"] = price_cv["price_cv"].fillna(0)
+    else:
+        price_cv = pd.DataFrame(columns=["_vendor", "price_cv"])
+
+    # ── ABC 등급 분포 (공급업체별 A등급 품목 수) ──────────────────────────
+    a_count = (
+        abc_df[abc_df["ABC"] == "A"]
+        .groupby("_vendor")
+        .size().reset_index(name="a_item_count")
+    )
+
+    # ── 데이터 통합 ────────────────────────────────────────────────────────
+    risk_df = vendor_spend.copy()
+    if not lt_df_calc.empty:
+        risk_df = risk_df.merge(lt_df_calc, on="_vendor", how="left")
+    else:
+        risk_df["lt_mean"] = np.nan
+        risk_df["lt_std"]  = np.nan
+        risk_df["lt_n"]    = 0
+
+    if not price_cv.empty:
+        risk_df = risk_df.merge(price_cv[["_vendor", "price_cv"]], on="_vendor", how="left")
+    else:
+        risk_df["price_cv"] = 0
+
+    risk_df = risk_df.merge(a_count, on="_vendor", how="left")
+    risk_df["a_item_count"] = risk_df["a_item_count"].fillna(0)
+    risk_df["price_cv"]     = risk_df["price_cv"].fillna(0)
+    risk_df["lt_std"]       = risk_df["lt_std"].fillna(0)
+
+    # ── Risk Score 계산 (100점 만점) ──────────────────────────────────────
+    # 납기안정성 점수 (낮을수록 위험)
+    max_lt_std = risk_df["lt_std"].max() or 1
+    risk_df["score_lt"]    = (1 - risk_df["lt_std"] / max_lt_std) * 30
+
+    # 가격안정성 점수 (변동성 낮을수록 안전)
+    max_cv = risk_df["price_cv"].max() or 1
+    risk_df["score_price"] = (1 - risk_df["price_cv"] / max_cv) * 25
+
+    # 집중도 점수 (의존도 높을수록 위험)
+    risk_df["score_conc"]  = (1 - risk_df["spend_share"] / 100) * 25
+
+    # 품목중요도 점수 (A등급 품목 적을수록 위험 낮음)
+    max_a = risk_df["a_item_count"].max() or 1
+    risk_df["score_item"]  = (1 - risk_df["a_item_count"] / max_a) * 20
+
+    risk_df["risk_score"]  = (risk_df["score_lt"] + risk_df["score_price"]
+                               + risk_df["score_conc"] + risk_df["score_item"])
+    # 위험도 = 100 - 안전점수
+    risk_df["danger_score"] = 100 - risk_df["risk_score"]
+    risk_df = risk_df.sort_values("danger_score", ascending=False)
+
+    # ── 시트 작성 ─────────────────────────────────────────────────────────
+    SR = 3
+    headers = ["협력사명", "위험등급", "위험점수\n(100점)", "최근12개월\n구매금액(원)",
+               "지출비중(%)", "A등급품목수", "납기변동성\n(σ일)",
+               "가격변동성\n(CV%)", "납기안정성\n(30점)", "가격안정성\n(25점)",
+               "집중도\n(25점)", "품목중요도\n(20점)"]
+    for c, h in enumerate(headers, 1):
+        hcell(ws.cell(SR, c), h)
+    ws.row_dimensions[SR].height = 36
+
+    r = SR + 1
+    for _, row in risk_df.iterrows():
+        ds = row["danger_score"]
+        # 위험등급 판정
+        if ds >= 70:
+            grade, grade_bg, row_bg = "🔴 고위험", "FF9999", "FFF0F0"
+        elif ds >= 45:
+            grade, grade_bg, row_bg = "🟡 중위험", "FFD966", "FFFBEA"
+        else:
+            grade, grade_bg, row_bg = "🟢 저위험", "C6EFCE", None
+
+        if row_bg:
+            for c in range(1, len(headers) + 1):
+                ws.cell(r, c).fill = PatternFill("solid", start_color=row_bg)
+
+        dcell(ws.cell(r, 1),  row["_vendor"])
+        dcell(ws.cell(r, 2),  grade, align="center", bold=True, bg=grade_bg)
+        dcell(ws.cell(r, 3),  round(ds, 1), align="center", bold=True, bg=grade_bg)
+        dcell(ws.cell(r, 4),  round(row["total_amount"]), NUM_FMT)
+        dcell(ws.cell(r, 5),  f"{row['spend_share']:.1f}%", align="center")
+        dcell(ws.cell(r, 6),  int(row["a_item_count"]), align="center")
+        lt_s = row["lt_std"]
+        dcell(ws.cell(r, 7),  f"{lt_s:.1f}" if lt_s > 0 else "데이터없음", align="center")
+        dcell(ws.cell(r, 8),  f"{row['price_cv']:.1f}%", align="center")
+        dcell(ws.cell(r, 9),  round(row["score_lt"], 1), align="center")
+        dcell(ws.cell(r, 10), round(row["score_price"], 1), align="center")
+        dcell(ws.cell(r, 11), round(row["score_conc"], 1), align="center")
+        dcell(ws.cell(r, 12), round(row["score_item"], 1), align="center")
+        r += 1
+
+    # 범례
+    ws.cell(r + 1, 1, "【위험 점수 구성】 납기안정성(30) + 가격안정성(25) + 집중도(25) + 품목중요도(20) = 100점 | 위험점수 = 100 - 안전점수")
+    ws.cell(r + 1, 1).font = Font(name=FONT_NAME, size=9, color="595959")
+
+    n_high = (risk_df["danger_score"] >= 70).sum()
+    n_mid  = ((risk_df["danger_score"] >= 45) & (risk_df["danger_score"] < 70)).sum()
+    ws.cell(r + 2, 1, f"전체 {len(risk_df)}개 협력사 — 🔴고위험 {n_high}개 / 🟡중위험 {n_mid}개 / 🟢저위험 {len(risk_df)-n_high-n_mid}개")
+    ws.cell(r + 2, 1).font = Font(name=FONT_NAME, bold=True, size=10)
+
+    for c, w in enumerate([22, 14, 12, 18, 12, 12, 14, 12, 12, 12, 10, 12], 1):
+        cw(ws, c, w)
+    ws.freeze_panes = f"A{SR + 1}"
+    ws.auto_filter.ref = f"A{SR}:L{SR + len(risk_df)}"
+    ws.sheet_view.showGridLines = False
+
+
+def _extract_cat_levels(series: pd.Series):
+    """
+    '가구 > 실내가구 > 사무용가구 > 거울' 형태의 카테고리를
+    대분류 / 중분류 / 소분류 / 세분류로 분리
+    """
+    split = series.astype(str).str.split(">")
+    def _get(lst, i):
+        try:
+            v = lst[i].strip()
+            return v if v not in ("nan", "None", "") else "미분류"
+        except (IndexError, AttributeError):
+            return "미분류"
+    return (
+        split.apply(lambda x: _get(x, 0)),   # 대분류
+        split.apply(lambda x: _get(x, 1)),   # 중분류
+        split.apply(lambda x: _get(x, 2)),   # 소분류
+        split.apply(lambda x: _get(x, 3)),   # 세분류
+    )
+
+
+def _spend_pareto_section(ws, r, recent, group_col, section_title,
+                          col_label, prod_type_col):
+    """
+    금액 내림차순 정렬 + Pareto(ABC) 자동 표시 공통 로직
+    """
+    ws.cell(r, 1, section_title)
+    ws.cell(r, 1).font = Font(name=FONT_NAME, bold=True, size=11, color="1F4E79")
+    ws.row_dimensions[r].height = 22
+    r += 1
+
+    headers = [col_label, "구매금액(원)", "비중(%)", "누적비중(%)", "ABC", "통신/일반", "건수"]
+    for c, h in enumerate(headers, 1):
+        hcell(ws.cell(r, c), h)
+    r += 1
+
+    cat_spend = (
+        recent.groupby(group_col)
+        .agg(total=("_amount", "sum"), cnt=("_amount", "count"))
+        .reset_index()
+        .sort_values("total", ascending=False)
+    )
+
+    if prod_type_col:
+        cat_type = (
+            recent.groupby(group_col)[prod_type_col]
+            .agg(lambda x: x.value_counts().index[0] if len(x) > 0 else "미분류")
+            .reset_index().rename(columns={prod_type_col: "prod_type"})
+        )
+        cat_spend = cat_spend.merge(cat_type, on=group_col, how="left")
+    else:
+        cat_spend["prod_type"] = "미분류"
+
+    grand = cat_spend["total"].sum()
+    cat_spend["pct"]     = cat_spend["total"] / grand * 100 if grand > 0 else 0
+    cat_spend["cum_pct"] = cat_spend["pct"].cumsum()
+    cat_spend["abc"]     = cat_spend["cum_pct"].apply(
+        lambda x: "A" if x <= 80 else ("B" if x <= 95 else "C")
+    )
+
+    for _, row in cat_spend.iterrows():
+        abc   = row["abc"]
+        abc_bg = C_A if abc == "A" else (C_B if abc == "B" else "F0F0F0")
+        pt    = row.get("prod_type", "미분류")
+        pt_bg = "D6E4F7" if pt == "통신" else ("E8F5E9" if pt == "일반" else "F5F5F5")
+        dcell(ws.cell(r, 1), row[group_col])
+        dcell(ws.cell(r, 2), round(row["total"]), NUM_FMT, bold=(abc == "A"))
+        dcell(ws.cell(r, 3), f"{row['pct']:.1f}%",     align="center")
+        dcell(ws.cell(r, 4), f"{row['cum_pct']:.1f}%", align="center")
+        dcell(ws.cell(r, 5), abc, align="center", bold=True, bg=abc_bg)
+        dcell(ws.cell(r, 6), pt,  align="center", bg=pt_bg)
+        dcell(ws.cell(r, 7), int(row["cnt"]), align="center")
+        r += 1
+
+    dcell(ws.cell(r, 1), "합계", bold=True)
+    dcell(ws.cell(r, 2), round(grand), NUM_FMT, bold=True, bg=C_TOTAL)
+    dcell(ws.cell(r, 7), int(cat_spend["cnt"].sum()), align="center", bold=True)
+    return r + 2
+
+
+def write_sheet_spend_analysis(wb, df: pd.DataFrame, current_ym):
+    """
+    카테고리별 Spend 분석 시트 (CPSM Module 1 Ch.2 Category Management 기반)
+    대분류 / 중분류 / 소분류 3단계 Pareto + 통신·일반×채널 매트릭스
+    """
+    ws = wb.create_sheet("카테고리_Spend분석")
+    sheet_title(ws, "카테고리별 지출(Spend) 분석",
+                "CPSM Module 1 Category Management — 대/중/소분류 Pareto × 통신·일반·채널 매트릭스")
+
+    # ── 최근 12개월 필터 ─────────────────────────────────────────────────
+    if "_ym" in df.columns:
+        max_ym = df["_ym"].max()
+        recent = df[df["_ym"] >= (max_ym - 11)].copy()
+    else:
+        recent = df.copy()
+
+    # ── 카테고리 컬럼 탐지 ───────────────────────────────────────────────
+    cat_col = next((c for c in df.columns
+                    if "서비스카테고리" in c or ("카테고리" in c and "_" not in c)), None)
+    if cat_col is None:
+        ws.cell(4, 1, "서비스카테고리 컬럼을 찾을 수 없습니다.")
+        return
+
+    # 대/중/소/세분류 추출
+    recent["_cat_L1"], recent["_cat_L2"], recent["_cat_L3"], recent["_cat_L4"] = \
+        _extract_cat_levels(recent[cat_col])
+
+    prod_type_col = "_prod_type" if "_prod_type" in recent.columns else None
+
+    # ── Section 1 · 2 · 3: 대/중/소분류 Pareto ─────────────────────────
+    SR = 3
+    r = SR
+    r = _spend_pareto_section(ws, r, recent, "_cat_L1",
+                               "▶ 1. 서비스 대분류별 지출 현황 (최근 12개월)",
+                               "서비스 대분류", prod_type_col)
+    r = _spend_pareto_section(ws, r, recent, "_cat_L2",
+                               "▶ 2. 서비스 중분류별 지출 현황 (최근 12개월)",
+                               "서비스 중분류", prod_type_col)
+    r = _spend_pareto_section(ws, r, recent, "_cat_L3",
+                               "▶ 3. 서비스 소분류별 지출 현황 (최근 12개월)",
+                               "서비스 소분류", prod_type_col)
+    r += 1
+
+    # ── Section 2: 통신/일반 × 채널별 Spend Cube ─────────────────────────
+    ws.cell(r, 1, "▶ 4. 통신/일반 × 채널별 지출 매트릭스 (최근 12개월)")
+    ws.cell(r, 1).font = Font(name=FONT_NAME, bold=True, size=11, color="1F4E79")
+    ws.row_dimensions[r].height = 22
+    r += 1
+
+    if prod_type_col and "_channel" in recent.columns:
+        CHANNELS_USE = ["KT", "그룹사", "외부사", "지입자재"]
+        prod_types = ["통신", "일반", "미분류"]
+
+        # 헤더
+        ws.cell(r, 1, "구분").font = Font(name=FONT_NAME, bold=True, size=10)
+        for ci, ch in enumerate(CHANNELS_USE, 2):
+            hcell(ws.cell(r, ci), ch)
+        hcell(ws.cell(r, len(CHANNELS_USE) + 2), "합계", bg=C_TOTAL)
+        r += 1
+
+        for pt in prod_types:
+            pt_bg = "D6E4F7" if pt == "통신" else ("E8F5E9" if pt == "일반" else "F5F5F5")
+            dcell(ws.cell(r, 1), pt, bold=True, bg=pt_bg)
+            row_total = 0
+            for ci, ch in enumerate(CHANNELS_USE, 2):
+                mask = (recent[prod_type_col] == pt) & (recent["_channel"] == ch)
+                val = round(recent[mask]["_amount"].sum())
+                row_total += val
+                dcell(ws.cell(r, ci), val if val > 0 else "", NUM_FMT, bg=pt_bg)
+            dcell(ws.cell(r, len(CHANNELS_USE) + 2), round(row_total),
+                  NUM_FMT, bold=True, bg=C_TOTAL)
+            r += 1
+
+        # 채널 합계 행
+        dcell(ws.cell(r, 1), "합계", bold=True, bg=C_TOTAL)
+        grand = 0
+        for ci, ch in enumerate(CHANNELS_USE, 2):
+            val = round(recent[recent["_channel"] == ch]["_amount"].sum())
+            grand += val
+            dcell(ws.cell(r, ci), val, NUM_FMT, bold=True, bg=C_TOTAL)
+        dcell(ws.cell(r, len(CHANNELS_USE) + 2), round(grand), NUM_FMT, bold=True, bg=C_TOTAL)
+
+    for c, w in enumerate([28, 18, 18, 12, 12, 10], 1):
+        cw(ws, c, w)
+    ws.freeze_panes = "A4"
+    ws.sheet_view.showGridLines = False
 
 
 def write_sheet4_accuracy(wb, acc_rows: list):
@@ -1152,6 +2247,183 @@ def write_sheet4_accuracy(wb, acc_rows: list):
     for c, w in enumerate([35,14,14,14,14,14,20], 1):
         cw(ws, c, w)
     ws.freeze_panes = f"A{SR+1}"
+    ws.auto_filter.ref = f"A{SR}:G{r-1}"
+
+
+def write_sheet_channel(wb, df: pd.DataFrame, current_ym,
+                        settle_cutoff, future_periods_list, rev_fc_vals=None):
+    """
+    Sheet: 채널별_분석
+    KT / 그룹사 / 외부사 / 지입자재 별 월별 실적 + 6개월 예측
+    """
+    ws = wb.create_sheet("채널별_분석")
+    sheet_title(ws, "채널별 매출 분석 (정산일 기준)",
+                f"KT / 그룹사 / 외부사 / 지입자재 채널별 월별 실적 + 예측")
+
+    # ── 채널별 정산일 기준 월별 집계 ──────────────────────────────────────
+    ch_colors = {"KT": "DDEEFF", "그룹사": "DDF0DD", "외부사": "FFF0CC", "지입자재": "FFE0E0"}
+    ch_header_colors = {"KT": "1F4E79", "그룹사": "375623", "외부사": "843C0C", "지입자재": "6B2737"}
+
+    SR = 3
+    # 헤더: 연월 | KT실적 | KT예측 | 그룹사실적 | 그룹사예측 | ...
+    col_headers = ["연월"]
+    for ch in CHANNELS:
+        col_headers += [f"{ch} 실적(원)", f"{ch} 예측(원)"]
+    col_headers.append("합계 실적(원)")
+    col_headers.append("합계 예측(원)")
+
+    for c, h in enumerate(col_headers, 1):
+        ch_name = None
+        for ch in CHANNELS:
+            if ch in h:
+                ch_name = ch
+                break
+        bg = ch_header_colors.get(ch_name, C_HEADER)
+        hcell(ws.cell(SR, c), h, bg=bg)
+    ws.row_dimensions[SR].height = 28
+
+    # ── 과거 실적 (정산일 기준, 채널별) ──────────────────────────────────
+    if "_settle_ym" in df.columns:
+        settle_df = df[df["_settle_ym"].notna() & (df["_settle_ym"] < settle_cutoff)].copy()
+        ch_grp = settle_df.groupby(["_channel", "_settle_ym"])["_amount"].sum().reset_index()
+        ch_grp.rename(columns={"_settle_ym": "_ym", "_amount": "amount"}, inplace=True)
+    else:
+        ch_grp = pd.DataFrame()
+
+    # 전체 기간 인덱스
+    if len(ch_grp) > 0:
+        all_yms = sorted(ch_grp["_ym"].unique())
+    else:
+        all_yms = []
+
+    r = SR + 1
+    for ym in all_yms:
+        ws.cell(r, 1, str(ym)).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(r, 1).border = tborder()
+        total_actual = 0
+        for ci, ch in enumerate(CHANNELS, 0):
+            col_actual = 2 + ci * 2
+            col_fcst   = 3 + ci * 2
+            val = ch_grp[(ch_grp["_channel"] == ch) & (ch_grp["_ym"] == ym)]["amount"]
+            v = float(val.iloc[0]) if len(val) > 0 else 0
+            total_actual += v
+            bg = ch_colors.get(ch)
+            dcell(ws.cell(r, col_actual), round(v) if v > 0 else "", NUM_FMT, bg=bg)
+            dcell(ws.cell(r, col_fcst),   "", bg=None)
+        dcell(ws.cell(r, 2 + len(CHANNELS)*2), round(total_actual) if total_actual > 0 else "",
+              NUM_FMT, bold=True, bg=C_TOTAL)
+        dcell(ws.cell(r, 3 + len(CHANNELS)*2), "", bg=None)
+        r += 1
+
+    # ── 예측 구간 (미완성 + 당월 + 미래) ──────────────────────────────────
+    for ym in future_periods_list:
+        is_incomplete = ym < current_ym
+        is_cur = ym == current_ym
+        bg_row = "FFF9C4" if (is_incomplete or is_cur) else None
+        lbl = "정산지연" if is_incomplete else ("당월" if is_cur else "")
+
+        ws.cell(r, 1, f"{ym} [{lbl}]" if lbl else str(ym))
+        ws.cell(r, 1).alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(r, 1).border = tborder()
+        if bg_row:
+            ws.cell(r, 1).fill = PatternFill("solid", start_color=bg_row)
+
+        # 채널별 예측: 채널별 과거 비율 기반 배분
+        # 최근 6개월 채널별 비중으로 예측 배분
+        recent_yms = [ym2 for ym2 in all_yms if ym2 >= (settle_cutoff - 6)]
+        ch_ratios = {}
+        for ch in CHANNELS:
+            ch_tot = ch_grp[(ch_grp["_channel"] == ch) &
+                            (ch_grp["_ym"].isin(recent_yms))]["amount"].sum()
+            ch_ratios[ch] = max(ch_tot, 0)
+        total_ratio = sum(ch_ratios.values())
+        if total_ratio == 0:
+            total_ratio = 1
+
+        # 매출 예측값 조회
+        fc_idx = future_periods_list.index(ym) if ym in future_periods_list else -1
+        if rev_fc_vals is not None and 0 <= fc_idx < len(rev_fc_vals):
+            total_fc = rev_fc_vals[fc_idx]
+        else:
+            total_fc = 0
+
+        for ci, ch in enumerate(CHANNELS, 0):
+            col_actual = 2 + ci * 2
+            col_fcst   = 3 + ci * 2
+            dcell(ws.cell(r, col_actual), "", bg=None)
+
+            # 채널별 예측값 = 전체 예측 × (채널비중/전체비중)
+            ch_fc = (total_fc * ch_ratios[ch] / total_ratio) if total_ratio > 0 else 0
+            bg = ch_colors.get(ch, bg_row)
+            dcell(ws.cell(r, col_fcst), round(ch_fc) if ch_fc > 0 else "", NUM_FMT, bg=bg)
+
+        # 합계 예측값도 채우기
+        dcell(ws.cell(r, 2 + len(CHANNELS)*2), "", bg=None)
+        dcell(ws.cell(r, 3 + len(CHANNELS)*2), round(total_fc) if total_fc > 0 else "",
+              NUM_FMT, bold=True, bg=C_TOTAL)
+        r += 1
+
+    ws.cell(r + 1, 1, "※ 채널 구분: 파일명 기준 (KT/그룹사/외부사/지입자재)")
+    ws.cell(r + 2, 1, "※ 예측 컬럼은 매출 예측 배분 기반 채널별 비중 적용")
+
+    for c, w in enumerate([14] + [18, 18] * len(CHANNELS) + [18, 18], 1):
+        cw(ws, c, w)
+    ws.freeze_panes = f"A{SR+1}"
+    ws.sheet_view.showGridLines = False
+
+
+def write_sheet_revenue(wb, revenue_train: pd.DataFrame,
+                         rev_future_periods, rev_fc_vals, rev_ci_lo, rev_ci_hi,
+                         rev_best: str, rev_mape: float, current_ym=None):
+    """Sheet 6: 정산일 기준 매출 예측"""
+    if current_ym is None:
+        current_ym = pd.Period(datetime.now(), freq="M")
+    ws = wb.create_sheet("매출예측_정산일기준")
+    sheet_title(ws, "매출 예측 (정산일 기준)",
+                f"실제 매출(정산완료 기준) 과거 추이 + 향후 6개월 예측")
+
+    SR = 3
+    headers = ["연월", "실제 정산금액(원)", "예측 정산금액(원)", "하한(95%)", "상한(95%)", "구분"]
+    for c, h in enumerate(headers, 1):
+        hcell(ws.cell(SR, c), h)
+    ws.row_dimensions[SR].height = 28
+
+    r = SR + 1
+    # 과거 실적
+    for _, row in revenue_train.iterrows():
+        dcell(ws.cell(r, 1), str(row["_ym"]), align="center")
+        dcell(ws.cell(r, 2), row["amount"], NUM_FMT)
+        dcell(ws.cell(r, 3), "", bg=None)
+        dcell(ws.cell(r, 4), "", bg=None)
+        dcell(ws.cell(r, 5), "", bg=None)
+        dcell(ws.cell(r, 6), "실적", align="center", bg=C_ACTUAL)
+        r += 1
+
+    # 예측
+    for i, p in enumerate(rev_future_periods):
+        is_lag = p < current_ym          # 지연 미완성 구간 (예: 5월)
+        is_cur = p == current_ym         # 당월 (6월)
+        bg  = "FFF9C4" if (is_lag or is_cur) else C_FCST
+        lbl = "정산지연(미완성)" if is_lag else ("이번 달 예측" if is_cur else "예측")
+        dcell(ws.cell(r, 1), str(p), align="center", bg=bg, bold=(i==0))
+        dcell(ws.cell(r, 2), "", bg=None)
+        dcell(ws.cell(r, 3), round(rev_fc_vals[i]),  NUM_FMT, bg=bg, bold=(i==0))
+        dcell(ws.cell(r, 4), round(rev_ci_lo[i] if i < len(rev_ci_lo) else 0),
+              NUM_FMT, bg=bg)
+        dcell(ws.cell(r, 5), round(rev_ci_hi[i] if i < len(rev_ci_hi) else 0),
+              NUM_FMT, bg=bg)
+        dcell(ws.cell(r, 6), lbl, align="center", bg=bg, bold=(i==0))
+        r += 1
+
+    # 모델 정보
+    ws.cell(r + 1, 1, f"※ 예측 모델: {rev_best}  |  MAPE: {rev_mape:.1f}%")
+    ws.cell(r + 2, 1, "※ 정산일 기준: 해당 월에 정산이 완료된 주문 건의 합계금액")
+    ws.cell(r + 3, 1, f"※ 노란색: 정산 미완성 예측 구간 (정산 지연 {SETTLE_LAG_MONTHS}개월 설정)")
+
+    for c, w in enumerate([14, 22, 22, 18, 18, 14], 1):
+        cw(ws, c, w)
+    ws.freeze_panes = f"A{SR+1}"
+    ws.sheet_view.showGridLines = False
 
 
 def write_sheet5_dashboard(wb, summary: dict):
@@ -1382,16 +2654,127 @@ def main():
             sys.exit(1)
 
         # ── 설정 저장 (다음 실행 시 재사용) ──────────────────────────────
-        save_config(filepaths, lead_time, lt_file_used, col_map)
+        save_config(filepaths, lead_time, lt_file_used, col_map, processed_files=[])
         print(f"\n[설정 저장] 다음 실행 시 자동으로 로드됩니다. ({CONFIG_FILE.name})")
 
-    # ── 데이터 로드 (복수 파일 병합) ─────────────────────────────────────
-    df = load_and_preprocess(filepaths, col_map, lead_time)
+    # ── 데이터 로드 (증분: 새 파일만 처리, 기존은 parquet 재사용) ──────────
+    processed_files = saved_cfg.get("processed_files", []) if saved_cfg else []
+    df, processed_files = load_incremental(filepaths, col_map, lead_time, processed_files)
 
-    # ── 전체 월별 집계 ────────────────────────────────────────────────────
-    overall_grp = build_monthly_series(df)
+    # parquet 재사용 시 _prod_type 누락 보완 (매핑 파일 기준 통신/일반 구분)
+    df = ensure_prod_type(df, col_map)
+
+    # 처리된 파일 목록을 config에 갱신 저장
+    save_config(filepaths, lead_time, lt_file_used, col_map, processed_files)
+
+    # ── 분석 범위 선택 (유가증권 제외 여부) ─────────────────────────────
+    # 유가증권 제외 조건 (OR):
+    #   ① 마스터카테고리(CMS) 가 "서비스/유가증권 > 유가증권" 으로 시작
+    #   ② 서비스카테고리 에 "캠페인용 상품권" 포함
+    #   ③ 서비스카테고리 가 "서비스/유가증권 > 유가증권" 으로 시작
+    #   ④ 서비스카테고리 가 "서비스 > 유가증권" 으로 시작
+    # 원본 컬럼명: 마스터카테고리(CMS), 서비스카테고리 (parquet 그대로 접근)
+
+    _amt_col   = "_amount" if "_amount" in df.columns else "amount"
+    _scope_tag = "전체"
+
+    # ── ① 마스터카테고리(CMS) ─────────────────────────────────────────
+    _CMS_COL = "마스터카테고리(CMS)"
+    if _CMS_COL in df.columns:
+        mask_cms = df[_CMS_COL].astype(str).str.startswith("서비스/유가증권 > 유가증권")
+    else:
+        mask_cms = pd.Series(False, index=df.index)
+
+    # ── ②③④ 서비스카테고리 ──────────────────────────────────────────
+    # col_map["category"] 가 실제 컬럼이면 우선 사용, 없으면 "서비스카테고리" 직접 접근
+    _SVC_COL = (col_map.get("category")
+                if col_map.get("category") and col_map["category"] in df.columns
+                else ("서비스카테고리" if "서비스카테고리" in df.columns else None))
+
+    if _SVC_COL:
+        _svc = df[_SVC_COL].astype(str)
+        mask_svc = (
+            _svc.str.contains("캠페인용 상품권", regex=False, na=False)   # ②
+            | _svc.str.startswith("서비스/유가증권 > 유가증권")             # ③
+            | _svc.str.startswith("서비스 > 유가증권")                    # ④
+        )
+    else:
+        mask_svc = pd.Series(False, index=df.index)
+
+    # ── 통합 마스크 ────────────────────────────────────────────────────
+    _sec_mask = mask_cms | mask_svc
+
+    # ── 감지 기준 문자열 구성 ─────────────────────────────────────────
+    _basis_parts = []
+    if mask_cms.any():
+        _basis_parts.append(_CMS_COL)
+    if mask_svc.any() and _SVC_COL:
+        _basis_parts.append(_SVC_COL)
+    if not _basis_parts:
+        # 카테고리 컬럼 없음 → 협력사명 fallback (데이터 없는 환경 대비)
+        if "_vendor" in df.columns:
+            _sec_mask = (df["_vendor"].astype(str)
+                         .str.replace(" ", "", regex=False)
+                         .str.lower()
+                         .str.contains("케이티커머스|kt커머스", regex=True, na=False))
+            _basis_parts.append("협력사명 fallback")
+    _detect_basis = " + ".join(_basis_parts) if _basis_parts else "감지 불가"
+
+    _sec_count = int(_sec_mask.sum())
+
+    if _sec_count > 0:
+        _sec_amt   = df.loc[_sec_mask, _amt_col].sum()
+        _total_amt = df[_amt_col].sum()
+        _sec_pct   = _sec_amt / _total_amt * 100 if _total_amt else 0
+
+        # 감지 내역 요약: CMS → 서비스카테고리 순으로 상위 5개
+        _ref_col = _CMS_COL if (_CMS_COL in df.columns and mask_cms.any()) else _SVC_COL
+        if _ref_col and _ref_col in df.columns:
+            _top5    = df.loc[_sec_mask, _ref_col].value_counts().head(5).index.tolist()
+            _summary = " / ".join(str(v) for v in _top5)
+        else:
+            _summary = "(카테고리 컬럼 없음)"
+
+        print("\n" + "─" * 65)
+        print("  [분석 범위 선택]")
+        print(f"  유가증권 감지 : {_sec_count:,}행  ({_sec_pct:.1f}%,  {_sec_amt:,.0f}원)")
+        print(f"  감지 기준     : {_detect_basis}")
+        print(f"  주요 항목     : {_summary}")
+        print()
+        print("  1. 전체 포함  — 유가증권 포함 전체 분석 (현행 방식)")
+        print("  2. 유가증권 제외 — 순수 자재/서비스만 분석")
+        print("  3. 통신자재만 — _prod_type='통신' 품목만 분석")
+        print("─" * 65)
+        _scope_sel = input("  선택 (기본값=1): ").strip()
+
+        if _scope_sel == "2":
+            df = df.loc[~_sec_mask].reset_index(drop=True)
+            _scope_tag = "유가증권제외"
+            print(f"  → 유가증권 {_sec_count:,}행 제외 완료 ({len(df):,}행 잔류)")
+            log.info(f"분석범위: 유가증권 제외 {_sec_count:,}건 ({_detect_basis} 기준)")
+        elif _scope_sel == "3":
+            if "_prod_type" in df.columns:
+                df = df.loc[df["_prod_type"] == "통신"].reset_index(drop=True)
+                _scope_tag = "통신자재"
+                print(f"  → 통신 품목만 필터링 완료 ({len(df):,}행 잔류)")
+                log.info("분석범위: _prod_type='통신' 필터 적용")
+            else:
+                print("  → 통신/일반 구분 정보 없음, 전체로 진행합니다.")
+        else:
+            print("  → 전체 포함으로 진행합니다.")
+
+    # ── 발주일 기준 수요 집계 (수량 예측용) ─────────────────────────────
+    current_ym     = pd.Period(datetime.now(), freq="M")
+    order_cutoff   = current_ym - ORDER_LAG_MONTHS   # 완성된 발주 데이터 상한
+
+    overall_grp = build_monthly_series(df, ym_col="_ym")
+    overall_grp = overall_grp.loc[overall_grp["_ym"] < order_cutoff].reset_index(drop=True)  # 미완성 월 제외
     overall_grp = trim_to_36months(overall_grp, "_ym")
     overall_grp.sort_values("_ym", inplace=True)
+
+    if ORDER_LAG_MONTHS > 0:
+        log.info(f"발주 완성 기준월: ~{order_cutoff - 1}  "
+                 f"(당월 {current_ym} 포함 {ORDER_LAG_MONTHS + 1}개월은 예측 대상)")
 
     min_ym = overall_grp["_ym"].min()
     max_ym = overall_grp["_ym"].max()
@@ -1399,9 +2782,34 @@ def main():
     overall_grp = overall_grp.set_index("_ym").reindex(full_idx, fill_value=0).reset_index()
     overall_grp.rename(columns={"index": "_ym"}, inplace=True)
 
-    log.info(f"전체 분석기간: {min_ym} ~ {max_ym} ({len(overall_grp)}개월)")
+    log.info(f"전체 분석기간(발주일): {min_ym} ~ {max_ym} ({len(overall_grp)}개월)")
 
-    # ── 전체 시계열 모델 평가 & 예측 ─────────────────────────────────────
+    # ── 정산일 기준 매출 집계 (금액 예측용) ─────────────────────────────
+    # current_ym은 위 발주일 블록에서 이미 정의됨
+    revenue_grp = build_monthly_series(df, ym_col="_settle_ym")
+    # 정산일 기준: 당월 이전까지만 훈련, 당월~이후는 예측 대상
+    # 정산 지연 반영: 당월 + SETTLE_LAG_MONTHS 개월 전까지만 완성 데이터로 간주
+    settle_cutoff = current_ym - SETTLE_LAG_MONTHS
+    revenue_grp_train = revenue_grp.loc[revenue_grp["_ym"] < settle_cutoff].reset_index(drop=True)
+    revenue_grp_train = trim_to_36months(revenue_grp_train, "_ym")
+    log.info(f"정산 완성 기준월: ~{settle_cutoff - 1}  "
+             f"(당월 {current_ym} 포함 {SETTLE_LAG_MONTHS+1}개월은 예측 대상)")
+    revenue_grp_train.sort_values("_ym", inplace=True)
+
+    if len(revenue_grp_train) >= 3:
+        rev_min_ym = revenue_grp_train["_ym"].min()
+        rev_max_ym = revenue_grp_train["_ym"].max()
+        rev_idx = pd.period_range(rev_min_ym, rev_max_ym, freq="M")
+        revenue_grp_train = (revenue_grp_train.set_index("_ym")
+                             .reindex(rev_idx, fill_value=0).reset_index())
+        revenue_grp_train.rename(columns={"index": "_ym"}, inplace=True)
+        log.info(f"전체 분석기간(정산일): {rev_min_ym} ~ {rev_max_ym} "
+                 f"({len(revenue_grp_train)}개월)")
+    else:
+        revenue_grp_train = overall_grp.copy()   # fallback
+        log.warning("정산일 기준 데이터 부족 → 발주일 기준으로 대체")
+
+    # ── 전체 시계열 모델 평가 & 예측 (발주일 기준 수요) ──────────────────
     print("\n[STEP 3-4] 전체 시계열 모델 평가 중...")
     overall_arr = overall_grp["amount"].values.astype(float)
 
@@ -1435,16 +2843,55 @@ def main():
     fc_vals, ci_lo, ci_hi = forecast_series(overall_arr, best_overall, h=6)
 
     overall_acc_row = {
-        "name": "전체 매출",
+        "name": "전체 수요(발주일)",
         "best": best_overall,
         "note": f"MAPE {best_mape:.1f}%" if not np.isnan(best_mape) else "",
     }
     for k, v in acc_results.items():
         overall_acc_row[k] = v["mape"]
 
+    # ── 정산일 기준 매출 예측 ─────────────────────────────────────────────
+    print("\n[매출예측] 정산일 기준 매출 예측 중...")
+    rev_arr = revenue_grp_train["amount"].values.astype(float)
+    rev_max_ym = revenue_grp_train["_ym"].max()
+    # 정산 지연 개월 포함해서 예측 (미완성 달부터 6개월)
+    rev_future_periods = pd.period_range(settle_cutoff, periods=6 + SETTLE_LAG_MONTHS,
+                                         freq="M")
+
+    rev_acc, rev_best = walk_forward_eval(rev_arr, "Holt-Winters")
+    rev_mape = rev_acc.get(rev_best, {}).get("mape", np.nan)
+    if not np.isnan(rev_mape) and rev_mape > 50:
+        rev_arr_s = rev_arr[-24:] if len(rev_arr) >= 24 else rev_arr
+        rev_acc_s, rev_best_s = walk_forward_eval(rev_arr_s, "Holt-Winters")
+        rev_mape_s = rev_acc_s.get(rev_best_s, {}).get("mape", np.nan)
+        if not np.isnan(rev_mape_s) and rev_mape_s < rev_mape:
+            rev_arr  = rev_arr_s
+            rev_best = rev_best_s
+            rev_mape = rev_mape_s
+            rev_acc  = rev_acc_s
+
+    # 예측: 현재 훈련 데이터 마지막 월+1 ~ 현재월+5 까지 충분히 생성
+    h_rev = (current_ym.ordinal - rev_max_ym.ordinal) + 5   # 이전 달 gap + 이번달~5개월
+    h_rev = max(h_rev, 6)
+    rev_fc, rev_ci_lo, rev_ci_hi = forecast_series(rev_arr, rev_best, h=int(h_rev))
+    # rev_future_periods 에 해당하는 인덱스 추출
+    rev_fc_periods = pd.period_range(rev_max_ym + 1, periods=int(h_rev), freq="M")
+    rev_fc_map = {p: (rev_fc[i], rev_ci_lo[i], rev_ci_hi[i])
+                  for i, p in enumerate(rev_fc_periods)}
+
+    rev_fc_vals  = np.array([rev_fc_map.get(p, (0, 0, 0))[0] for p in rev_future_periods])
+    rev_ci_lo_v  = np.array([rev_fc_map.get(p, (0, 0, 0))[1] for p in rev_future_periods])
+    rev_ci_hi_v  = np.array([rev_fc_map.get(p, (0, 0, 0))[2] for p in rev_future_periods])
+
+    log.info(f"매출예측(정산일): {rev_best} MAPE={rev_mape:.1f}%")
+    log.info(f"  예측기간: {rev_future_periods[0]} ~ {rev_future_periods[-1]}")
+    for p, v in zip(rev_future_periods, rev_fc_vals):
+        log.info(f"  {p}: {v:,.0f}원")
+
     # ── 협력사×상품코드 집계 ──────────────────────────────────────────────
     print("[STEP 1] 협력사×상품코드 월별 집계 중...")
-    group_grp = build_monthly_series(df, group_cols=["_vendor", "_prod_key"])
+    group_grp = build_monthly_series(df, group_cols=["_channel", "_vendor", "_prod_key"])
+    group_grp = group_grp.loc[group_grp["_ym"] < order_cutoff].reset_index(drop=True)  # 미완성 월 제외
     group_grp = trim_to_36months(group_grp, "_ym")
 
     # ── ABC × CV ─────────────────────────────────────────────────────────
@@ -1474,14 +2921,20 @@ def main():
         print("       다음 실행 시 자동 적용됩니다.\n")
 
     # ── 안전재고 / ROP ────────────────────────────────────────────────────
-    ss_rop = {}
-    for _, row in abc_df.iterrows():
-        key = (row["_vendor"], row["_prod_key"])
-        lt_m, lt_s = get_lt_stats(lt_stats, lt_df, row["_vendor"], row["_prod_key"])
+    # 품목별 수량 배열 사전 구성 (O(1) 조회로 속도 개선)
+    print("[SS/ROP] 안전재고·ROP 계산 중...")
+    grp_qty = {
+        (ch, v, p): g.sort_values("_ym")["qty"].values.astype(float)
+        for (ch, v, p), g in group_grp.groupby(["_channel", "_vendor", "_prod_key"], observed=True)
+    }
 
-        sub = group_grp[(group_grp["_vendor"]==row["_vendor"]) &
-                        (group_grp["_prod_key"]==row["_prod_key"])].sort_values("_ym")
-        qty_arr = sub["qty"].values.astype(float)
+    ss_rop = {}
+    ab_items = abc_df[abc_df["ABC"].isin(["A", "B"])]  # C등급은 SS/ROP 생략
+    for _, row in ab_items.iterrows():
+        key = (row["_vendor"], row["_prod_key"])
+        ch  = row.get("_channel", "기타")
+        lt_m, lt_s = get_lt_stats(lt_stats, lt_df, row["_vendor"], row["_prod_key"])
+        qty_arr = grp_qty.get((ch, row["_vendor"], row["_prod_key"]), np.array([]))
         if len(qty_arr) >= 2:
             ss, formula = calc_safety_stock(qty_arr, lt_m, lt_s)
             rop = calc_rop(qty_arr, lt_m, ss)
@@ -1489,6 +2942,19 @@ def main():
             ss, rop, formula = 0.0, 0.0, "데이터부족"
         ss_rop[key] = {"ss": ss, "rop": rop, "lead_time": lt_m,
                        "lt_std": lt_s, "formula": formula}
+    print(f"  → SS/ROP 완료: {len(ss_rop):,}개 품목")
+
+    # ── 상품코드별 통신/일반 구분 사전 구성 ──────────────────────────────
+    # df에서 _prod_key → _prod_type 매핑 (동일 상품코드는 최초 값 사용)
+    if "_prod_type" in df.columns:
+        prod_type_lookup = (
+            df[["_prod_key", "_prod_type"]]
+            .drop_duplicates(subset=["_prod_key"])
+            .set_index("_prod_key")["_prod_type"]
+            .to_dict()
+        )
+    else:
+        prod_type_lookup = {}
 
     # ── 개별 시계열 예측 ──────────────────────────────────────────────────
     print("[STEP 3-4] 개별 시계열 예측 중...")
@@ -1510,18 +2976,27 @@ def main():
     for idx, (_, row) in enumerate(target_items.iterrows(), 1):
         vendor   = row["_vendor"]
         prod_key = row["_prod_key"]
+        channel  = row.get("_channel", None)
         abc      = row["ABC"]
         strategy = row["strategy"]
 
-        sub = group_grp[(group_grp["_vendor"]==vendor) &
-                        (group_grp["_prod_key"]==prod_key)].sort_values("_ym")
+        mask = (group_grp["_vendor"] == vendor) & (group_grp["_prod_key"] == prod_key)
+        if channel is not None and "_channel" in group_grp.columns:
+            mask &= (group_grp["_channel"] == channel)
+        sub = group_grp[mask].sort_values("_ym")
         if len(sub) < 3:
             log.debug(f"건너뜀(데이터 부족): {vendor} / {prod_key}")
             continue
 
-        # 결측 월 보간
+        # 결측 월 보간 (수치 컬럼만 0 채움, 문자열 컬럼은 ffill)
         sub_idx = pd.period_range(sub["_ym"].min(), sub["_ym"].max(), freq="M")
-        sub = sub.set_index("_ym").reindex(sub_idx, fill_value=0).reset_index()
+        sub = sub.set_index("_ym").reindex(sub_idx)
+        num_cols = sub.select_dtypes(include="number").columns
+        sub[num_cols] = sub[num_cols].fillna(0)
+        str_cols = [c for c in sub.columns if c not in num_cols]
+        if str_cols:
+            sub[str_cols] = sub[str_cols].ffill().bfill()
+        sub = sub.reset_index()
         sub.rename(columns={"index": "_ym"}, inplace=True)
 
         if check_consecutive_zeros(sub["amount"].values, threshold=3):
@@ -1542,15 +3017,27 @@ def main():
             fc6, fc_lo, fc_hi = forecast_series(arr, best_item, h=6)
             item_mape = sub_acc.get(best_item, {}).get("mape", np.nan)
 
+            # Tracking Signal 계산 (walk-forward 검증 구간 사용)
+            n_test_ts = min(6, max(1, len(arr) // 4))
+            ts_train, ts_test = arr[:-n_test_ts], arr[-n_test_ts:]
+            try:
+                ts_fc, _ = forecast_series(ts_train, best_item, h=n_test_ts)[:2], None
+                ts_fc = ts_fc[0]
+                ts_val = _tracking_signal(ts_test, ts_fc)
+            except Exception:
+                ts_val = np.nan
+
             avg12 = float(np.mean(arr[-12:])) if len(arr) >= 12 else float(np.mean(arr))
             detail_rows.append({
-                "vendor":   vendor,
-                "prod_key": prod_key,
-                "ABC":      abc,
-                "avg12":    avg12,
-                "fc6":      fc6,
-                "model":    best_item,
-                "mape":     item_mape,
+                "vendor":          vendor,
+                "prod_key":        prod_key,
+                "ABC":             abc,
+                "avg12":           avg12,
+                "fc6":             fc6,
+                "model":           best_item,
+                "mape":            item_mape,
+                "prod_type":       prod_type_lookup.get(prod_key, "미분류"),
+                "tracking_signal": ts_val,
             })
 
             acc_row = {"name": f"{vendor} / {prod_key}", "best": best_item,
@@ -1573,7 +3060,9 @@ def main():
     # ── 요약 지표 ─────────────────────────────────────────────────────────
     all_mapes = [r.get(r["best"], np.nan) for r in acc_rows
                  if r["best"] in r and not np.isnan(r.get(r["best"], np.nan))]
-    avg_mape = float(np.nanmean(all_mapes)) if all_mapes else np.nan
+    # 극단 이상치 제외 후 중위값 사용 (단순 평균은 MAPE 300% 품목에 왜곡됨)
+    valid_mapes = [v for v in all_mapes if v <= 300]
+    avg_mape = float(np.median(valid_mapes)) if valid_mapes else np.nan
 
     total_fc6 = float(np.sum(fc_vals))
 
@@ -1589,8 +3078,20 @@ def main():
     }
 
     # ── Excel 출력 ────────────────────────────────────────────────────────
-    out_name = f"수요예측_{datetime.now().strftime('%Y%m')}.xlsx"
-    out_path = BASE_DIR / out_name
+    _scope_suffix = f"_{_scope_tag}" if _scope_tag != "전체" else ""
+    _base_name = f"수요예측_{datetime.now().strftime('%Y%m')}{_scope_suffix}"
+    out_path = BASE_DIR / f"{_base_name}.xlsx"
+    # 파일이 열려 있거나 OneDrive 잠금 시 _1, _2 ... 순번 파일명으로 우회
+    if out_path.exists():
+        _suffix = 1
+        while out_path.exists():
+            try:
+                out_path.rename(out_path)   # 잠금 여부 테스트 (이름 변경 없이 시도)
+                break                       # 잠금 없음 → 덮어쓰기 가능
+            except PermissionError:
+                out_path = BASE_DIR / f"{_base_name}_{_suffix}.xlsx"
+                _suffix += 1
+    out_name = out_path.name
     print(f"\n[출력] {out_name} 작성 중...")
 
     import openpyxl
@@ -1600,20 +3101,56 @@ def main():
     write_sheet5_dashboard(wb, summary)
     write_sheet1_overall(wb, overall_grp, fc_vals, ci_lo, ci_hi,
                           best_overall, best_mape, future_periods)
+    write_sheet_revenue(wb, revenue_grp_train,
+                        rev_future_periods, rev_fc_vals, rev_ci_lo_v, rev_ci_hi_v,
+                        rev_best, rev_mape, current_ym=current_ym)
+    write_sheet_channel(wb, df, current_ym, settle_cutoff,
+                        list(rev_future_periods), rev_fc_vals)
     write_sheet2_abc(wb, abc_df, ss_rop)
+    write_sheet_forecast_detail(wb, detail_rows, ss_rop)
+    write_sheet_tracking_signal(wb, detail_rows)
+    write_sheet_supplier_risk(wb, df, abc_df)
+    write_sheet_spend_analysis(wb, df, current_ym)
     write_sheet3_detail(wb, detail_rows)
     write_sheet4_accuracy(wb, acc_rows)
 
-    wb.save(out_path)
-    log.info(f"저장 완료: {out_path}")
+    # 저장 시 PermissionError(파일 열림/OneDrive 잠금) 처리
+    _save_suffix = 1
+    while True:
+        try:
+            wb.save(out_path)
+            log.info(f"저장 완료: {out_path}")
+            break
+        except PermissionError:
+            _base = f"수요예측_{datetime.now().strftime('%Y%m')}"
+            out_path = BASE_DIR / f"{_base}_{_save_suffix}.xlsx"
+            out_name = out_path.name
+            print(f"  [주의] 파일 잠김 → {out_name} 으로 저장 시도...")
+            _save_suffix += 1
+            if _save_suffix > 9:
+                print("  [오류] 저장 파일명을 확보할 수 없습니다. Excel을 닫고 재시도하세요.")
+                raise
 
     # ── 최종 요약 출력 ────────────────────────────────────────────────────
     print("\n" + "=" * 65)
+    print(f"  [분석 범위: {_scope_tag}]")
+    print(f"  [발주일 기준 수요]")
     print(f"  분석 기간          : {summary['data_range']}")
-    print(f"  전체 최적 모델     : {best_overall}  (MAPE {best_mape:.1f}%)")
-    print(f"  향후 6개월 예측총액: {total_fc6:,.0f} 원")
+    print(f"  예측 모델          : {best_overall}  (MAPE {best_mape:.1f}%)")
     print(f"  A등급 품목 수      : {summary['n_A']}개")
     print(f"  주의 시계열 수     : {len(warn_list)}개 (MAPE > 30%)")
+    print()
+    print(f"  [정산일 기준 매출]")
+    print(f"  예측 모델          : {rev_best}  (MAPE {rev_mape:.1f}%)")
+    for p, v in zip(rev_future_periods, rev_fc_vals):
+        if p < current_ym:
+            flag = " ← 정산지연(미완성 예측)"
+        elif p == current_ym:
+            flag = " ← 이번 달"
+        else:
+            flag = ""
+        print(f"  {p}  : {v:>20,.0f} 원{flag}")
+    print()
     print(f"  출력 파일          : {out_path.name}")
     print("=" * 65)
 
