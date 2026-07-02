@@ -16,6 +16,9 @@ REQUIRED_PKGS = {
     "openpyxl":     "openpyxl",
     "xlsxwriter":   "xlsxwriter",
     "pyarrow":      "pyarrow",      # ← parquet 저장/로드용
+    "prophet":      "prophet",      # ← Meta Prophet 시계열 모델
+    "lightgbm":     "lightgbm",     # ← LightGBM 래그 피처 모델
+    "requests":     "requests",     # ← 한국은행 ECOS API 호출
 }
 
 def _detect_win_proxy():
@@ -1238,6 +1241,83 @@ def model_ma3(train: np.ndarray, h: int):
     return fc, resid_std
 
 
+def model_prophet(train: np.ndarray, h: int):
+    """Meta Prophet — 연간 계절성 + 변동점 자동 감지. 반환: (fc, resid_std, ci_lo, ci_hi)"""
+    from prophet import Prophet
+    n = len(train)
+    if n < 12:
+        raise ValueError("Prophet: 12개월 미만")
+    dates = pd.date_range(
+        end=pd.Timestamp.now().replace(day=1) - pd.DateOffset(months=1),
+        periods=n, freq="MS",
+    )
+    df_p = pd.DataFrame({"ds": dates, "y": train.astype(float)})
+    m = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        interval_width=0.95,
+        changepoint_prior_scale=0.05,
+    )
+    import logging as _lg
+    _lg.getLogger("prophet").setLevel(_lg.WARNING)
+    _lg.getLogger("cmdstanpy").setLevel(_lg.WARNING)
+    m.fit(df_p)
+    future = m.make_future_dataframe(periods=h, freq="MS")
+    forecast = m.predict(future)
+    fc     = np.maximum(forecast["yhat"].values[-h:], 0)
+    ci_lo  = np.maximum(forecast["yhat_lower"].values[-h:], 0)
+    ci_hi  = forecast["yhat_upper"].values[-h:]
+    resid_std = float(np.std(train - forecast["yhat"].values[:n]))
+    return fc, resid_std, ci_lo, ci_hi
+
+
+def model_lgbm(train: np.ndarray, h: int):
+    """LightGBM 래그 피처 — 반복 예측 방식. 반환: (fc, resid_std)"""
+    import lightgbm as lgb
+    n = len(train)
+    if n < 13:
+        raise ValueError("LightGBM: 13개월 미만")
+
+    LAGS = [l for l in [1, 2, 3, 6, 12] if l < n]
+
+    def make_features(arr, start_i):
+        rows = []
+        for i in range(start_i, len(arr)):
+            feat = [arr[i - l] for l in LAGS]
+            feat.append(i % 12)
+            feat.append(float(np.mean(arr[max(0, i - 3):i])))
+            rows.append(feat)
+        return np.array(rows)
+
+    max_lag  = max(LAGS)
+    X_train  = make_features(train, max_lag)
+    y_train  = train[max_lag:]
+    if len(X_train) < 5:
+        raise ValueError("LightGBM: 학습 샘플 부족")
+
+    model = lgb.LGBMRegressor(
+        n_estimators=100, learning_rate=0.05,
+        num_leaves=15, min_child_samples=3,
+        verbose=-1, random_state=42,
+    )
+    model.fit(X_train, y_train)
+
+    history = list(train)
+    preds = []
+    for step in range(h):
+        feat = [history[-l] for l in LAGS]
+        feat.append((n + step) % 12)
+        feat.append(float(np.mean(history[-3:])))
+        pred = max(float(model.predict([feat])[0]), 0)
+        preds.append(pred)
+        history.append(pred)
+
+    fc = np.array(preds)
+    resid_std = float(np.std(y_train - model.predict(X_train)))
+    return fc, resid_std
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 5. Walk-forward 검증 & 최적 모델 선택
 # ════════════════════════════════════════════════════════════════════════════
@@ -1300,6 +1380,30 @@ def walk_forward_eval(series: np.ndarray, strategy: str, n_test=6):
     except Exception:
         results["MA3"] = {"mape": np.nan, "mae": np.nan, "rmse": np.nan}
 
+    # Prophet
+    try:
+        fc_pr, _, _, _ = model_prophet(train, h)
+        results["Prophet"] = {
+            "mape": _mape(test, fc_pr),
+            "mae":  _mae(test, fc_pr),
+            "rmse": _rmse(test, fc_pr),
+        }
+    except Exception as e:
+        log.debug(f"Prophet 검증 실패: {e}")
+        results["Prophet"] = {"mape": np.nan, "mae": np.nan, "rmse": np.nan}
+
+    # LightGBM
+    try:
+        fc_lgb, _ = model_lgbm(train, h)
+        results["LightGBM"] = {
+            "mape": _mape(test, fc_lgb),
+            "mae":  _mae(test, fc_lgb),
+            "rmse": _rmse(test, fc_lgb),
+        }
+    except Exception as e:
+        log.debug(f"LightGBM 검증 실패: {e}")
+        results["LightGBM"] = {"mape": np.nan, "mae": np.nan, "rmse": np.nan}
+
     # 최적 모델 선택 (MAPE 기준, NaN 제외)
     valid = {k: v for k, v in results.items() if not np.isnan(v["mape"])}
     if not valid:
@@ -1332,9 +1436,13 @@ def forecast_series(series: np.ndarray, best_model: str, h=6):
         elif best_model == "SARIMA":
             res = model_sarima(series, h)
             fc, rs = res[0], res[1]
-            ci = np.array(res[2])   # DataFrame or ndarray 모두 처리
+            ci = np.array(res[2])
             ci_lo = ci[:, 0]
             ci_hi = ci[:, 1]
+        elif best_model == "Prophet":
+            fc, rs, ci_lo, ci_hi = model_prophet(series, h)
+        elif best_model == "LightGBM":
+            fc, rs = model_lgbm(series, h)
         else:
             fc, rs = model_ma3(series, h)
     except Exception as e:
@@ -1346,6 +1454,98 @@ def forecast_series(series: np.ndarray, best_model: str, h=6):
         ci_lo = np.maximum(fc - Z_CI * rs, 0)
         ci_hi = fc + Z_CI * rs
     return fc, ci_lo, ci_hi
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 5-B. 신제품 콜드스타트 예측
+# ════════════════════════════════════════════════════════════════════════════
+COLDSTART_THRESHOLD = 6   # 이 개월 수 미만이면 콜드스타트로 처리
+
+def forecast_coldstart(arr: np.ndarray, category_avg: np.ndarray, h: int = 6):
+    """
+    데이터가 COLDSTART_THRESHOLD개월 미만인 신제품용 예측.
+    동일 카테고리 평균 성장 패턴을 스케일해 적용.
+    반환: (fc, ci_lo, ci_hi)
+    """
+    n = len(arr)
+    if n == 0:
+        return np.zeros(h), np.zeros(h), np.zeros(h)
+
+    last_val = float(arr[-1]) if arr[-1] > 0 else float(np.mean(arr[arr > 0]) if np.any(arr > 0) else 1)
+
+    if len(category_avg) >= h + 1:
+        # 카테고리 패턴의 마지막 n개월 평균 대비 스케일 계산
+        ref_level = float(np.mean(category_avg[-n:])) if np.mean(category_avg[-n:]) > 0 else 1
+        scale = last_val / ref_level
+        fc = np.maximum(category_avg[-h:] * scale, 0)
+    else:
+        # 카테고리 데이터 없으면 MA로 fallback
+        fc = np.full(h, last_val)
+
+    std = float(np.std(arr)) if n > 1 else last_val * 0.3
+    ci_lo = np.maximum(fc - Z_CI * std, 0)
+    ci_hi = fc + Z_CI * std
+    return fc, ci_lo, ci_hi
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 5-C. 한국은행 ECOS 외부 지표 연동 (소비자심리지수 등)
+# ════════════════════════════════════════════════════════════════════════════
+ECOS_API_KEY_FILE = BASE_DIR / "ecos_api_key.txt"
+ECOS_SERIES = {
+    "소비자심리지수(CSI)": ("521Y001", "I22A"),
+    "경기동행지수":        ("901Y067", "I_CLI"),
+}
+
+def fetch_ecos_data(n_months: int = 36) -> dict:
+    """
+    한국은행 ECOS Open API에서 거시경제 지표를 가져옵니다.
+    API 키가 없으면 빈 dict 반환 (선택 기능).
+
+    API 키 발급: https://ecos.bok.or.kr/api/#/DevGuide/APIKey
+    발급 후 ecos_api_key.txt 파일에 키를 저장하세요.
+    """
+    if not ECOS_API_KEY_FILE.exists():
+        log.info("ECOS API 키 없음 → 외부지표 시트 생략 (ecos_api_key.txt 생성 시 활성화)")
+        return {}
+
+    api_key = ECOS_API_KEY_FILE.read_text(encoding="utf-8").strip()
+    if not api_key:
+        return {}
+
+    try:
+        import requests
+    except ImportError:
+        log.warning("requests 미설치 → ECOS 데이터 생략")
+        return {}
+
+    end_dt   = pd.Timestamp.now()
+    start_dt = end_dt - pd.DateOffset(months=n_months + 1)
+    start_str = start_dt.strftime("%Y%m")
+    end_str   = end_dt.strftime("%Y%m")
+
+    results = {}
+    for label, (stat_code, item_code) in ECOS_SERIES.items():
+        try:
+            url = (
+                f"https://ecos.bok.or.kr/api/StatisticSearch/{api_key}/json/kr/1/100/"
+                f"{stat_code}/MM/{start_str}/{end_str}/{item_code}"
+            )
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            rows = data.get("StatisticSearch", {}).get("row", [])
+            if not rows:
+                continue
+            df_e = pd.DataFrame(rows)[["TIME", "DATA_VALUE"]].copy()
+            df_e["ym"]  = df_e["TIME"].apply(lambda x: pd.Period(x, freq="M"))
+            df_e["val"] = pd.to_numeric(df_e["DATA_VALUE"], errors="coerce")
+            df_e = df_e.dropna(subset=["val"]).sort_values("ym")
+            results[label] = df_e[["ym", "val"]].reset_index(drop=True)
+            log.info(f"ECOS [{label}]: {len(df_e)}개월 로드 완료")
+        except Exception as e:
+            log.warning(f"ECOS [{label}] 로드 실패: {e}")
+
+    return results
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2426,6 +2626,91 @@ def write_sheet_revenue(wb, revenue_train: pd.DataFrame,
     ws.sheet_view.showGridLines = False
 
 
+def write_sheet_xai(wb, acc_rows: list):
+    """
+    XAI(설명 가능한 AI) 시트 — 시계열별 모델 경쟁 결과 및 선택 근거 표시.
+    각 행: 시계열명 / 선택모델 / HW·SARIMA·선형회귀·MA3·Prophet·LightGBM MAPE / 선택 이유
+    """
+    ws = wb.create_sheet("XAI_모델선택근거")
+    sheet_title(ws, "XAI — 예측 모델 선택 근거",
+                "각 시계열별 전체 후보 모델 MAPE와 최종 선택 이유를 확인할 수 있습니다.")
+
+    MODELS = ["Holt-Winters", "SARIMA", "선형회귀", "MA3", "Prophet", "LightGBM"]
+    headers = ["시계열명", "등급", "선택모델"] + [f"{m}\nMAPE(%)" for m in MODELS] + ["선택 근거"]
+    r = 3
+    for c, h in enumerate(headers, 1):
+        hcell(ws.cell(r, c), h, size=9)
+
+    def _reason(row):
+        best = row.get("best", "")
+        mapes = {m: row.get(m, np.nan) for m in MODELS}
+        valid  = {m: v for m, v in mapes.items() if not np.isnan(v)}
+        if not valid:
+            return "데이터 부족 — 검증 불가"
+        sorted_m = sorted(valid, key=lambda x: valid[x])
+        rank1, rank2 = sorted_m[0], sorted_m[1] if len(sorted_m) > 1 else None
+        gap = valid[rank1] if rank2 is None else valid[rank2] - valid[rank1]
+        reason = f"MAPE 최소({valid[rank1]:.1f}%)"
+        if rank2 and gap < 2:
+            reason += f" — {rank2}({valid[rank2]:.1f}%)와 근소 차이"
+        if best != rank1:
+            reason += f" ※ ABC 전략({best}) 유지"
+        return reason
+
+    alt = False
+    for row in acc_rows:
+        r += 1
+        bg = C_ALT if alt else None
+        alt = not alt
+        name  = row.get("name", "")
+        grade = row.get("note", "")
+        best  = row.get("best", "")
+        dcell(ws.cell(r, 1), name,  align="left",   bg=bg)
+        dcell(ws.cell(r, 2), grade, align="center",  bg=bg)
+        best_bg = "E2EFDA" if not np.isnan(row.get(best, np.nan)) and row.get(best, 999) < 20 else \
+                  C_WARN   if not np.isnan(row.get(best, np.nan)) and row.get(best, 999) > 30 else bg
+        dcell(ws.cell(r, 3), best, align="center", bg=best_bg)
+        for ci, m in enumerate(MODELS, 4):
+            val = row.get(m, np.nan)
+            if np.isnan(val):
+                dcell(ws.cell(r, ci), "—", align="center", bg=bg)
+            else:
+                cell_bg = "E2EFDA" if m == best else (C_WARN if val > 30 else bg)
+                dcell(ws.cell(r, ci), round(val, 1), fmt="0.0", align="center", bg=cell_bg)
+        dcell(ws.cell(r, len(MODELS) + 4), _reason(row), align="left", bg=bg)
+
+    widths = [35, 6, 14] + [12] * len(MODELS) + [50]
+    for ci, w in enumerate(widths, 1):
+        cw(ws, ci, w)
+    ws.row_dimensions[3].height = 30
+    ws.freeze_panes = "A4"
+    ws.sheet_view.showGridLines = False
+
+
+def write_sheet_ecos(wb, ecos_data: dict):
+    """한국은행 ECOS 외부 지표 시트 — 소비자심리지수 등 거시지표 추이"""
+    if not ecos_data:
+        return
+    ws = wb.create_sheet("외부지표_ECOS")
+    sheet_title(ws, "한국은행 ECOS 거시경제 지표",
+                "수요 예측 보조 지표 — 소비자심리지수(CSI) 등 외부 환경 모니터링")
+
+    col = 1
+    for label, df_e in ecos_data.items():
+        r = 3
+        hcell(ws.cell(r, col),   "연월")
+        hcell(ws.cell(r, col+1), label)
+        for _, erow in df_e.iterrows():
+            r += 1
+            dcell(ws.cell(r, col),   str(erow["ym"]),  align="center")
+            dcell(ws.cell(r, col+1), round(float(erow["val"]), 2), fmt="0.00")
+        cw(ws, col,   12)
+        cw(ws, col+1, 18)
+        col += 3
+
+    ws.sheet_view.showGridLines = False
+
+
 def write_sheet5_dashboard(wb, summary: dict):
     ws = wb.create_sheet("CPSM_요약대시보드", 0)
     sheet_title(ws, "CPSM 수요예측 요약 대시보드",
@@ -2656,6 +2941,10 @@ def main():
         # ── 설정 저장 (다음 실행 시 재사용) ──────────────────────────────
         save_config(filepaths, lead_time, lt_file_used, col_map, processed_files=[])
         print(f"\n[설정 저장] 다음 실행 시 자동으로 로드됩니다. ({CONFIG_FILE.name})")
+
+    # ── 한국은행 ECOS 외부 지표 (API 키 있을 때만) ───────────────────────
+    print("\n[외부지표] 한국은행 ECOS 데이터 조회 중...")
+    ecos_data = fetch_ecos_data(n_months=36)
 
     # ── 데이터 로드 (증분: 새 파일만 처리, 기존은 parquet 재사용) ──────────
     processed_files = saved_cfg.get("processed_files", []) if saved_cfg else []
@@ -2984,7 +3273,8 @@ def main():
         if channel is not None and "_channel" in group_grp.columns:
             mask &= (group_grp["_channel"] == channel)
         sub = group_grp[mask].sort_values("_ym")
-        if len(sub) < 3:
+        is_coldstart = len(sub) < COLDSTART_THRESHOLD
+        if len(sub) < 2:
             log.debug(f"건너뜀(데이터 부족): {vendor} / {prod_key}")
             continue
 
@@ -3006,16 +3296,25 @@ def main():
         arr = sub["amount"].values.astype(float)
 
         try:
-            if large_mode and abc != "A":
+            if is_coldstart:
+                # 콜드스타트: 카테고리 전체 평균 패턴 스케일 적용
+                _cat_arr = overall_arr  # 전체 평균을 카테고리 대용으로 사용
+                fc6, fc_lo, fc_hi = forecast_coldstart(arr, _cat_arr, h=6)
+                sub_acc   = {}
+                best_item = "콜드스타트"
+                item_mape = np.nan
+            elif large_mode and abc != "A":
                 # 단일 모델 (HW 또는 전략 모델)
                 _strat = strategy if strategy != "SARIMA" else "Holt-Winters"
                 sub_acc = {_strat: {"mape": np.nan, "mae": np.nan, "rmse": np.nan}}
                 best_item = _strat
+                fc6, fc_lo, fc_hi = forecast_series(arr, best_item, h=6)
             else:
                 sub_acc, best_item = walk_forward_eval(arr, strategy)
+                fc6, fc_lo, fc_hi = forecast_series(arr, best_item, h=6)
 
-            fc6, fc_lo, fc_hi = forecast_series(arr, best_item, h=6)
-            item_mape = sub_acc.get(best_item, {}).get("mape", np.nan)
+            if not is_coldstart:
+                item_mape = sub_acc.get(best_item, {}).get("mape", np.nan)
 
             # Tracking Signal 계산 (walk-forward 검증 구간 사용)
             n_test_ts = min(6, max(1, len(arr) // 4))
@@ -3038,6 +3337,7 @@ def main():
                 "mape":            item_mape,
                 "prod_type":       prod_type_lookup.get(prod_key, "미분류"),
                 "tracking_signal": ts_val,
+                "coldstart":       is_coldstart,
             })
 
             acc_row = {"name": f"{vendor} / {prod_key}", "best": best_item,
@@ -3113,6 +3413,8 @@ def main():
     write_sheet_spend_analysis(wb, df, current_ym)
     write_sheet3_detail(wb, detail_rows)
     write_sheet4_accuracy(wb, acc_rows)
+    write_sheet_xai(wb, acc_rows)
+    write_sheet_ecos(wb, ecos_data)
 
     # 저장 시 PermissionError(파일 열림/OneDrive 잠금) 처리
     _save_suffix = 1
