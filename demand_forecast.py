@@ -418,8 +418,12 @@ def ensure_prod_type(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
 # ════════════════════════════════════════════════════════════════════════════
 # 0. 상수 및 스타일
 # ════════════════════════════════════════════════════════════════════════════
-Z_95 = 1.65   # 서비스수준 95%
+Z_SS = 2.05   # 서비스수준 98% (MRO 가용성 기준)
 Z_CI = 1.96   # 95% 신뢰구간
+
+# ── MRO/KT이관 설정 ──────────────────────────────────────────────────────────
+TRANSFER_DATE    = None   # KT SCM 이관 시점 예) "2023-04-01". None이면 전체 기간 사용
+ENABLE_COLD_START = False  # 이관 품목은 이력 있음 → 콜드스타트 비활성화
 
 FONT_NAME = "맑은 고딕"
 C_HEADER  = "1F4E79"; C_HFG = "FFFFFF"
@@ -1702,6 +1706,47 @@ def make_lead_time_template(abc_df: pd.DataFrame, out_path: Path):
     log.info(f"리드타임 템플릿 생성: {out_path.name}")
 
 
+def detect_lifecycle(arr: np.ndarray) -> dict:
+    """
+    수요 시계열에서 제품 수명주기(PLC) 단계 자동 판정.
+    MRO·이관 품목 특성상 성숙기·쇠퇴기 감지에 집중.
+
+    반환:
+      stage      : "성장기" | "성숙기" | "쇠퇴기" | "단종임박"
+      decline_pct: 최근 6개월 vs 이전 6개월 수요 감소율 (%)
+      eol_ym     : 선형 외삽 기반 단종 예상 연월 (str) — 쇠퇴기 이상일 때만
+    """
+    n = len(arr)
+    if n < 6:
+        return {"stage": "성숙기", "decline_pct": 0.0, "eol_ym": None}
+
+    recent = float(np.mean(arr[-6:]))
+    prev   = float(np.mean(arr[-12:-6])) if n >= 12 else float(np.mean(arr[:-6]))
+
+    decline_pct = (prev - recent) / prev * 100 if prev > 1e-6 else 0.0
+
+    # 선형 추세로 EOL 추정 (수요가 0이 되는 시점)
+    eol_ym = None
+    if decline_pct > 10:
+        slope = np.polyfit(np.arange(min(n, 12)), arr[-min(n, 12):], 1)[0]
+        if slope < 0 and recent > 0:
+            months_to_zero = int(recent / abs(slope))
+            months_to_zero = min(months_to_zero, 60)  # 최대 5년
+            eol_period = pd.Period(pd.Timestamp.now(), freq="M") + months_to_zero
+            eol_ym = str(eol_period)
+
+    if decline_pct >= 50:
+        stage = "단종임박"
+    elif decline_pct >= 20:
+        stage = "쇠퇴기"
+    elif decline_pct >= 0:
+        stage = "성숙기"
+    else:
+        stage = "성장기"
+
+    return {"stage": stage, "decline_pct": round(decline_pct, 1), "eol_ym": eol_ym}
+
+
 def calc_safety_stock(qty_series: np.ndarray,
                       lt_mean: float, lt_std: float = 0.0) -> tuple[float, str]:
     """
@@ -1726,10 +1771,10 @@ def calc_safety_stock(qty_series: np.ndarray,
     sigma_lt = lt_std  / 30
 
     if sigma_lt > 0:
-        ss = Z_95 * np.sqrt(lt_m * sigma_d**2 + d_avg**2 * sigma_lt**2)
+        ss = Z_SS * np.sqrt(lt_m * sigma_d**2 + d_avg**2 * sigma_lt**2)
         formula = "완전공식(수요+LT변동)"
     else:
-        ss = Z_95 * sigma_d * np.sqrt(lt_m)
+        ss = Z_SS * sigma_d * np.sqrt(lt_m)
         formula = "기본공식(수요변동만)"
 
     return max(ss, 0.0), formula
@@ -3052,11 +3097,24 @@ def main():
         else:
             print("  → 전체 포함으로 진행합니다.")
 
+    # ── 이관 시점 필터 (KT SCM → 자사 이관 이후 데이터만 예측에 사용) ──────
+    df_forecast = df.copy()
+    if TRANSFER_DATE:
+        _td = pd.Timestamp(TRANSFER_DATE)
+        df_forecast = df_forecast[df_forecast["_date"] >= _td].reset_index(drop=True)
+        n_filtered = len(df) - len(df_forecast)
+        log.info(f"이관 시점 필터({TRANSFER_DATE}): {n_filtered:,}행 제외 → "
+                 f"예측 학습 {len(df_forecast):,}행")
+        print(f"\n[이관 필터] {TRANSFER_DATE} 이후 데이터만 예측 학습에 사용 "
+              f"({len(df_forecast):,}행)")
+    else:
+        log.info("이관 시점 필터 미적용 (TRANSFER_DATE=None)")
+
     # ── 발주일 기준 수요 집계 (수량 예측용) ─────────────────────────────
     current_ym     = pd.Period(datetime.now(), freq="M")
     order_cutoff   = current_ym - ORDER_LAG_MONTHS   # 완성된 발주 데이터 상한
 
-    overall_grp = build_monthly_series(df, ym_col="_ym")
+    overall_grp = build_monthly_series(df_forecast, ym_col="_ym")
     overall_grp = overall_grp.loc[overall_grp["_ym"] < order_cutoff].reset_index(drop=True)  # 미완성 월 제외
     overall_grp = trim_to_36months(overall_grp, "_ym")
     overall_grp.sort_values("_ym", inplace=True)
@@ -3075,7 +3133,7 @@ def main():
 
     # ── 정산일 기준 매출 집계 (금액 예측용) ─────────────────────────────
     # current_ym은 위 발주일 블록에서 이미 정의됨
-    revenue_grp = build_monthly_series(df, ym_col="_settle_ym")
+    revenue_grp = build_monthly_series(df_forecast, ym_col="_settle_ym")
     # 정산일 기준: 당월 이전까지만 훈련, 당월~이후는 예측 대상
     # 정산 지연 반영: 당월 + SETTLE_LAG_MONTHS 개월 전까지만 완성 데이터로 간주
     settle_cutoff = current_ym - SETTLE_LAG_MONTHS
@@ -3179,7 +3237,7 @@ def main():
 
     # ── 협력사×상품코드 집계 ──────────────────────────────────────────────
     print("[STEP 1] 협력사×상품코드 월별 집계 중...")
-    group_grp = build_monthly_series(df, group_cols=["_channel", "_vendor", "_prod_key"])
+    group_grp = build_monthly_series(df_forecast, group_cols=["_channel", "_vendor", "_prod_key"])
     group_grp = group_grp.loc[group_grp["_ym"] < order_cutoff].reset_index(drop=True)  # 미완성 월 제외
     group_grp = trim_to_36months(group_grp, "_ym")
 
@@ -3218,17 +3276,23 @@ def main():
     }
 
     ss_rop = {}
-    ab_items = abc_df[abc_df["ABC"].isin(["A", "B"])]  # C등급은 SS/ROP 생략
-    for _, row in ab_items.iterrows():
+    all_items = abc_df  # MRO: C등급도 가용성 필수 → 전체 포함
+    for _, row in all_items.iterrows():
         key = (row["_vendor"], row["_prod_key"])
         ch  = row.get("_channel", "기타")
+        abc = row["ABC"]
         lt_m, lt_s = get_lt_stats(lt_stats, lt_df, row["_vendor"], row["_prod_key"])
         qty_arr = grp_qty.get((ch, row["_vendor"], row["_prod_key"]), np.array([]))
         if len(qty_arr) >= 2:
             ss, formula = calc_safety_stock(qty_arr, lt_m, lt_s)
+            if abc == "C":
+                ss = max(ss, 1.0)   # C등급 최소 1개 보유 (MRO 가용성)
+                formula += "+C등급최소1"
             rop = calc_rop(qty_arr, lt_m, ss)
         else:
-            ss, rop, formula = 0.0, 0.0, "데이터부족"
+            ss  = 1.0 if abc == "C" else 0.0
+            rop = 0.0
+            formula = "C등급최소1" if abc == "C" else "데이터부족"
         ss_rop[key] = {"ss": ss, "rop": rop, "lead_time": lt_m,
                        "lt_std": lt_s, "formula": formula}
     print(f"  → SS/ROP 완료: {len(ss_rop):,}개 품목")
@@ -3273,7 +3337,7 @@ def main():
         if channel is not None and "_channel" in group_grp.columns:
             mask &= (group_grp["_channel"] == channel)
         sub = group_grp[mask].sort_values("_ym")
-        is_coldstart = len(sub) < COLDSTART_THRESHOLD
+        is_coldstart = (len(sub) < COLDSTART_THRESHOLD) and ENABLE_COLD_START
         if len(sub) < 2:
             log.debug(f"건너뜀(데이터 부족): {vendor} / {prod_key}")
             continue
@@ -3327,17 +3391,21 @@ def main():
                 ts_val = np.nan
 
             avg12 = float(np.mean(arr[-12:])) if len(arr) >= 12 else float(np.mean(arr))
+            lc    = detect_lifecycle(arr)
             detail_rows.append({
-                "vendor":          vendor,
-                "prod_key":        prod_key,
-                "ABC":             abc,
-                "avg12":           avg12,
-                "fc6":             fc6,
-                "model":           best_item,
-                "mape":            item_mape,
-                "prod_type":       prod_type_lookup.get(prod_key, "미분류"),
-                "tracking_signal": ts_val,
-                "coldstart":       is_coldstart,
+                "vendor":           vendor,
+                "prod_key":         prod_key,
+                "ABC":              abc,
+                "avg12":            avg12,
+                "fc6":              fc6,
+                "model":            best_item,
+                "mape":             item_mape,
+                "prod_type":        prod_type_lookup.get(prod_key, "미분류"),
+                "tracking_signal":  ts_val,
+                "coldstart":        is_coldstart,
+                "lifecycle_stage":  lc["stage"],
+                "decline_pct":      lc["decline_pct"],
+                "eol_ym":           lc["eol_ym"],
             })
 
             acc_row = {"name": f"{vendor} / {prod_key}", "best": best_item,
