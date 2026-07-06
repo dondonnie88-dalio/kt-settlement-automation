@@ -498,8 +498,13 @@ def ensure_prod_type(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
 # ════════════════════════════════════════════════════════════════════════════
 # 0. 상수 및 스타일
 # ════════════════════════════════════════════════════════════════════════════
-Z_SS = 2.05   # 서비스수준 98% (MRO 가용성 기준 — KT SCM 이관 품목 기본값)
-Z_CI = 1.96   # 95% 신뢰구간
+Z_SS  = 2.05  # 서비스수준 98% (MRO 가용성 기준 — KT SCM 이관 품목 기본값)
+Z_CI  = 1.96  # 95% 신뢰구간
+Z_CUST = 1.65  # 고객사 자체 관리 시 서비스수준 95% 가정 (QBR 절감액 산출 기준)
+
+# ── QBR 안전재고 절감액 산출 설정 ──────────────────────────────────────────
+# 연간 재고 보유비용률: 자본비용 + 창고비 + 진부화 손실 합산 업종 표준 20~30%
+HOLDING_COST_RATE = 0.25  # 25% — 고객사 QBR 절감액 추정 시 사용
 
 # ── MRO 이관 설정 ──────────────────────────────────────────────────────────
 # KT SCM 이관 시점. None 이면 전체 기간 학습. 설정 시 이관 후 데이터만 사용.
@@ -4123,6 +4128,158 @@ def write_sheet_ecos(wb, ecos_data: dict):
     ws.sheet_view.showGridLines = False
 
 
+def write_sheet_qbr_savings(wb, detail_rows: list, ss_rop: dict, df_raw: pd.DataFrame):
+    """
+    QBR용 안전재고 절감액 자동 산출 시트.
+
+    고객사가 KT Commerce 없이 직접 소싱할 경우 필요한 안전재고(SL 95%)와
+    KT Commerce 이용 시 제거 가능한 보유비용을 품목별로 산출.
+
+    전제:
+      - 고객사 자체 SS = Z_CUST(1.65) × σ_D × √LT  (SL 95% 자체 관리 기준)
+      - KTC 납기 보장 시 고객사 보유 SS = 0 (KTC가 납기 확률 98%로 흡수)
+      - 연간 보유비용 = SS × 단가 × HOLDING_COST_RATE(25%)
+    """
+    ws = wb.create_sheet("QBR_안전재고절감분석")
+    ws.tab_color = "375623"
+    sheet_title(
+        ws, "QBR — KT Commerce 이용 시 고객사 안전재고 절감 분석",
+        f"전제: 고객사 자체관리 SL 95%(Z=1.65) / 연간 보유비용률 {HOLDING_COST_RATE:.0%} / "
+        f"KTC 납기보장 SL 98%(Z={Z_SS})"
+    )
+
+    # ── 품목별 단가 산출 (최근 12개월 실적 기준 가중평균 단가) ──────────────
+    unit_price_map: dict = {}
+    if not df_raw.empty and "_qty" in df_raw.columns and "_amount" in df_raw.columns:
+        grp_cols = ["_vendor", "_prod_key"] if "_vendor" in df_raw.columns else ["_prod_key"]
+        try:
+            up = (
+                df_raw.groupby(grp_cols)
+                .apply(lambda g: g["_amount"].sum() / g["_qty"].sum()
+                       if g["_qty"].sum() > 0 else 0.0)
+                .reset_index(name="_unit_price")
+            )
+            for _, row in up.iterrows():
+                if len(grp_cols) == 2:
+                    key = (str(row["_vendor"]), str(row["_prod_key"]))
+                else:
+                    key = ("", str(row["_prod_key"]))
+                unit_price_map[key] = float(row["_unit_price"])
+        except Exception:
+            pass
+
+    # ── 헤더 ──────────────────────────────────────────────────────────────
+    SR = 4
+    headers = [
+        "협력사명", "상품코드", "상품명", "ABC등급",
+        "월평균수요(개)", "LT평균(일)", "수요σ(개/월)",
+        "고객사 자체SS\n(SL95%, 개)", "KTC이용 후\n고객SS(개)",
+        "SS절감\n(개)", "단가(원)",
+        "연간 보유비용\n절감 추정액(원)",
+        "재고일수\n절감(일)", "비고",
+    ]
+    for c, h in enumerate(headers, 1):
+        hcell(ws.cell(SR, c), h, size=9)
+    ws.row_dimensions[SR].height = 32
+
+    # ── 데이터 행 ─────────────────────────────────────────────────────────
+    r = SR
+    total_saving = 0.0
+    alt = False
+
+    for row in detail_rows:
+        vendor   = row.get("vendor", "")
+        prod_key = row.get("prod_key", "")
+        abc      = row.get("ABC", "")
+        avg12    = row.get("avg12", 0.0)
+        key      = (vendor, prod_key)
+
+        sr_data  = ss_rop.get(key, {})
+        ss_ktc   = sr_data.get("ss", 0.0)           # KTC 내부 SS (SL 98%)
+        lt_days  = sr_data.get("lead_time", 30.0) * 30   # 월 → 일
+        lt_m     = lt_days / 30
+
+        # σ_D 역산: ss_ktc = Z_SS × σ_D × √LT_m (기본공식 기준)
+        sigma_d = (ss_ktc / (Z_SS * np.sqrt(lt_m))) if (lt_m > 0 and ss_ktc > 0) else 0.0
+
+        # 고객사 자체 SS (SL 95%)
+        cust_ss = Z_CUST * sigma_d * np.sqrt(lt_m)
+
+        # KTC 이용 시 고객 보유 SS = 0 (납기 보장으로 완충재고 불필요)
+        ktc_cust_ss = 0.0
+
+        ss_reduction = max(cust_ss - ktc_cust_ss, 0.0)
+
+        # 단가
+        unit_price = unit_price_map.get(key, unit_price_map.get(("", prod_key), 0.0))
+
+        # 연간 보유비용 절감 = SS절감량 × 단가 × HOLDING_COST_RATE
+        annual_saving = ss_reduction * unit_price * HOLDING_COST_RATE
+
+        # 재고일수 절감 = SS절감 / 일평균수요
+        daily_avg = avg12 / 30.0
+        days_saved = (ss_reduction / daily_avg) if daily_avg > 0 else 0.0
+
+        total_saving += annual_saving
+
+        r += 1
+        bg = C_ALT if alt else None
+        alt = not alt
+
+        note = ""
+        if abc == "C":
+            note = "C등급: 최소1개 유지"
+        elif row.get("lifecycle_stage", "") in ("쇠퇴기", "단종임박"):
+            note = f"⚠ {row.get('lifecycle_stage', '')} — 재고 검토 권고"
+
+        dcell(ws.cell(r, 1),  vendor,             align="left",   bg=bg)
+        dcell(ws.cell(r, 2),  prod_key,            align="center", bg=bg)
+        dcell(ws.cell(r, 3),  row.get("prod_name",""), align="left", bg=bg)
+        dcell(ws.cell(r, 4),  abc,                 align="center", bg=bg)
+        dcell(ws.cell(r, 5),  round(avg12, 1),     fmt="0.0",      bg=bg)
+        dcell(ws.cell(r, 6),  round(lt_days, 0),   fmt="0",        bg=bg)
+        dcell(ws.cell(r, 7),  round(sigma_d, 2),   fmt="0.00",     bg=bg)
+        dcell(ws.cell(r, 8),  round(cust_ss, 1),   fmt="0.0",      bg=bg)
+        dcell(ws.cell(r, 9),  round(ktc_cust_ss,1),fmt="0.0",  align="center", bg="E2EFDA")
+        dcell(ws.cell(r, 10), round(ss_reduction,1),fmt="0.0",     bg=bg)
+        dcell(ws.cell(r, 11), round(unit_price, 0), fmt="#,##0",   bg=bg)
+        # 절감액 — 의미 있는 금액만 색상 강조
+        saving_bg = "E2EFDA" if annual_saving >= 100_000 else (C_WARN if annual_saving == 0 and unit_price > 0 else bg)
+        dcell(ws.cell(r, 12), round(annual_saving, 0), fmt="#,##0", bg=saving_bg)
+        dcell(ws.cell(r, 13), round(days_saved, 1),    fmt="0.0",   bg=bg)
+        dcell(ws.cell(r, 14), note, align="left", bg=bg)
+
+    # ── 합계 행 ───────────────────────────────────────────────────────────
+    r += 1
+    hcell(ws.cell(r, 1), "합  계", bg="1F4E79")
+    for c in range(2, 12):
+        ws.cell(r, c).value = None
+    dcell(ws.cell(r, 12), round(total_saving, 0), fmt="#,##0", bold=True, bg="375623")
+    ws.cell(r, 12).font = __import__("openpyxl").styles.Font(
+        bold=True, color="FFFFFF", size=11)
+
+    # ── 안내 문구 (QBR 발표용) ────────────────────────────────────────────
+    r += 2
+    note_lines = [
+        "【QBR 활용 안내】",
+        f"  · 고객사 자체관리 SS: 직접 소싱 시 SL 95% 유지를 위해 보유해야 할 안전재고 추정치입니다.",
+        f"  · KTC 이용 후 SS = 0: KT Commerce 납기 보장(SL {Z_SS*100-100:.0f}+%) 활용 시 고객사 완충재고 불필요.",
+        f"  · 연간 절감 추정액 = SS절감(개) × 단가 × {HOLDING_COST_RATE:.0%} (자본비용·창고비·진부화 합산 보유비용률).",
+        f"  · 단가 미입력 품목(0원)은 절감액이 산출되지 않습니다. 별도 입력 후 재실행하세요.",
+    ]
+    for line in note_lines:
+        dcell(ws.cell(r, 1), line, align="left")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=14)
+        r += 1
+
+    # ── 열 너비 ───────────────────────────────────────────────────────────
+    widths = [20, 16, 24, 6, 10, 8, 10, 12, 12, 10, 14, 18, 10, 24]
+    for ci, w in enumerate(widths, 1):
+        cw(ws, ci, w)
+    ws.freeze_panes = "A5"
+    ws.sheet_view.showGridLines = False
+
+
 def write_sheet5_dashboard(wb, summary: dict):
     ws = wb.create_sheet("CPSM_요약대시보드", 0)
     sheet_title(ws, "CPSM 수요예측 요약 대시보드",
@@ -4995,6 +5152,7 @@ def main():
     write_sheet2_abc(wb, abc_df, ss_rop)                                   # 8. ABC_CV_분류표
     write_sheet_xai(wb, acc_rows)                                          # 9. XAI_모델선택근거
     write_sheet_ecos(wb, ecos_data)                                        # 10. 외부지표_ECOS (API 키 있을 때만)
+    write_sheet_qbr_savings(wb, detail_rows, ss_rop, df)                   # 11. QBR_안전재고절감분석
 
     # [내부용] 제거된 시트 목록 (호출 안 함):
     #   write_sheet5_dashboard  → 기술 KPI 대시보드 (초보자 무의미)
