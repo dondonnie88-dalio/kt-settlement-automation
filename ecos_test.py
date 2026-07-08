@@ -2,8 +2,11 @@
 ECOS API 진단 스크립트 — demand_forecast.py와 같은 폴더에서 실행
 python ecos_test.py
 """
-import requests, json, sys
+import requests, json, sys, urllib3
 from pathlib import Path
+
+# 사내 SSL 검사(SSL Inspection) 환경 대응 — 인증서 검증 경고 숨김
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── API 키 로드 ──────────────────────────────────────────────────────────
 KEY_FILE = Path(__file__).parent / "ecos_api_key.txt"
@@ -14,13 +17,14 @@ else:
     print(f"[오류] {KEY_FILE} 없음 — 파일을 만들고 키를 저장하세요")
     sys.exit(1)
 
-BASE = f"https://ecos.bok.or.kr/api"
+BASE = "https://ecos.bok.or.kr/api"
+GET  = lambda url: requests.get(url, timeout=15, verify=False)
 
 # ── 1단계: 통계 목록 검색으로 정확한 코드 확인 ────────────────────────────
 print("\n[1단계] 소비자동향조사 통계 검색...")
 url = f"{BASE}/StatisticSearch/{API_KEY}/json/kr/1/10/521Y001/MM/202501/202506"
 try:
-    r = requests.get(url, timeout=15)
+    r = GET(url)
     print(f"  HTTP {r.status_code}")
     data = r.json()
     rows = data.get("StatisticSearch", {}).get("row", [])
@@ -35,7 +39,7 @@ except Exception as e:
 print("\n[2단계] 521Y001 통계의 항목 코드 목록...")
 url = f"{BASE}/StatisticItemList/{API_KEY}/json/kr/1/50/521Y001"
 try:
-    r = requests.get(url, timeout=15)
+    r = GET(url)
     data = r.json()
     items = data.get("StatisticItemList", {}).get("row", [])
     if items:
@@ -61,7 +65,7 @@ for label, stat, item in candidates:
     if item:
         url += f"/{item}"
     try:
-        r = requests.get(url, timeout=10)
+        r = GET(url)
         data = r.json()
         rows = data.get("StatisticSearch", {}).get("row", [])
         if rows:

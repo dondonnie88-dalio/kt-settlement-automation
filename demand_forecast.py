@@ -1925,6 +1925,8 @@ def fetch_ecos_data(n_months: int = 36) -> dict:
 
     try:
         import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     except ImportError:
         log.warning("requests 미설치 → ECOS 데이터 생략")
         return {}
@@ -1941,7 +1943,7 @@ def fetch_ecos_data(n_months: int = 36) -> dict:
                 f"https://ecos.bok.or.kr/api/StatisticSearch/{api_key}/json/kr/1/100/"
                 f"{stat_code}/MM/{start_str}/{end_str}/{item_code}"
             )
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=10, verify=False)
             data = resp.json()
             rows = data.get("StatisticSearch", {}).get("row", [])
             if not rows:
