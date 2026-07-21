@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block title %}KT 정산 자동화 · 파일 업로드{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>정산 대사 실행</h1>
+  <p class="page-desc">KT 정산 파일과 플랫폼 파일을 업로드하면 자동으로 대사를 수행하고 Excel 결과를 생성합니다.</p>
+</div>
+
+<form method="POST" action="/run" enctype="multipart/form-data" id="uploadForm">
+  <div class="card-grid">
+
+    <!-- 파일 업로드 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-icon">📄</span>
+        <h2>파일 업로드</h2>
+      </div>
+      <div class="card-body">
+        <div class="file-upload-area" id="ktDrop" onclick="document.getElementById('kt_file').click()">
+          <div class="file-icon">📊</div>
+          <div class="file-label">KT 정산 파일</div>
+          <div class="file-hint">kt_raw.xlsx · 클릭 또는 드래그</div>
+          <div class="file-name" id="ktName">선택된 파일 없음</div>
+          <input type="file" id="kt_file" name="kt_file" accept=".xlsx,.xls,.xlsm"
+                 onchange="showName(this,'ktName')" style="display:none" required>
+        </div>
+
+        <div class="file-upload-area" id="plDrop" onclick="document.getElementById('pl_file').click()">
+          <div class="file-icon">📋</div>
+          <div class="file-label">플랫폼 정산 파일</div>
+          <div class="file-hint">platform.xlsx · 클릭 또는 드래그</div>
+          <div class="file-name" id="plName">선택된 파일 없음</div>
+          <input type="file" id="pl_file" name="pl_file" accept=".xlsx,.xls,.xlsm"
+                 onchange="showName(this,'plName')" style="display:none" required>
+        </div>
+      </div>
+    </div>
+
+    <!-- 정산 기간 -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-icon">📅</span>
+        <h2>정산 기간 설정</h2>
+      </div>
+      <div class="card-body">
+        <div class="period-toggle">
+          <label class="radio-option">
+            <input type="radio" name="period_mode" value="auto" id="modeAuto"
+                   onchange="togglePeriod(false)">
+            <span class="radio-label">자동 감지</span>
+            <span class="radio-desc">매월 1일·16일 실행 시 자동 설정</span>
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="period_mode" value="manual" id="modeManual"
+                   checked onchange="togglePeriod(true)">
+            <span class="radio-label">직접 입력</span>
+            <span class="radio-desc">임의 기간 지정</span>
+          </label>
+        </div>
+
+        <div id="manualPeriod" class="period-inputs">
+          <div class="input-row">
+            <div class="input-group">
+              <label for="period_start">시작일</label>
+              <input type="date" id="period_start" name="period_start"
+                     value="{{ today_start }}" required>
+            </div>
+            <span class="period-sep">~</span>
+            <div class="input-group">
+              <label for="period_end">종료일</label>
+              <input type="date" id="period_end" name="period_end"
+                     value="{{ today_end }}" required>
+            </div>
+          </div>
+          <div class="period-shortcut">
+            <button type="button" class="btn-sm" onclick="setRange(1,15)">1~15일</button>
+            <button type="button" class="btn-sm" onclick="setRange(16,'last')">16~말일</button>
+            <button type="button" class="btn-sm" onclick="setMonthRange(-1)">전월 전체</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /card-grid -->
+
+  <div class="submit-area">
+    <button type="submit" class="btn-primary" id="submitBtn">
+      <span class="btn-icon">⚙️</span> 정산 대사 실행
+    </button>
+    <p class="submit-hint">실행에 몇 초가 소요될 수 있습니다.</p>
+  </div>
+</form>
+
+<!-- 처리 중 오버레이 -->
+<div class="overlay" id="overlay">
+  <div class="spinner-box">
+    <div class="spinner"></div>
+    <p>정산 대사 처리 중입니다…</p>
+  </div>
+</div>
+
+<script>
+  function showName(input, labelId) {
+    const label = document.getElementById(labelId);
+    label.textContent = input.files[0] ? input.files[0].name : '선택된 파일 없음';
+    label.classList.toggle('has-file', !!input.files[0]);
+  }
+
+  function togglePeriod(show) {
+    document.getElementById('manualPeriod').style.display = show ? 'block' : 'none';
+    // 자동 모드에서는 required 해제
+    document.getElementById('period_start').required = show;
+    document.getElementById('period_end').required = show;
+  }
+
+  function setRange(start, end) {
+    const now = new Date();
+    const y = now.getFullYear(), m = now.getMonth() + 1;
+    const mm = String(m).padStart(2, '0');
+    const lastDay = new Date(y, m, 0).getDate();
+    const endDay  = end === 'last' ? lastDay : end;
+    document.getElementById('period_start').value = `${y}-${mm}-${String(start).padStart(2,'0')}`;
+    document.getElementById('period_end').value   = `${y}-${mm}-${String(endDay).padStart(2,'0')}`;
+  }
+
+  function setMonthRange(offset) {
+    const d = new Date();
+    d.setMonth(d.getMonth() + offset);
+    const y = d.getFullYear(), m = d.getMonth() + 1;
+    const mm = String(m).padStart(2, '0');
+    const lastDay = new Date(y, m, 0).getDate();
+    document.getElementById('period_start').value = `${y}-${mm}-01`;
+    document.getElementById('period_end').value   = `${y}-${mm}-${lastDay}`;
+  }
+
+  // 드래그 앤 드롭
+  function setupDrop(dropId, inputId, nameId) {
+    const drop  = document.getElementById(dropId);
+    const input = document.getElementById(inputId);
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag-over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
+    drop.addEventListener('drop', e => {
+      e.preventDefault();
+      drop.classList.remove('drag-over');
+      const files = e.dataTransfer.files;
+      if (files.length > 0) {
+        const dt = new DataTransfer();
+        dt.items.add(files[0]);
+        input.files = dt.files;
+        document.getElementById(nameId).textContent = files[0].name;
+        document.getElementById(nameId).classList.add('has-file');
+      }
+    });
+  }
+  setupDrop('ktDrop', 'kt_file', 'ktName');
+  setupDrop('plDrop', 'pl_file', 'plName');
+
+  // 폼 제출 시 오버레이
+  document.getElementById('uploadForm').addEventListener('submit', function() {
+    document.getElementById('overlay').style.display = 'flex';
+  });
+
+  // 기본 날짜 설정
+  (function() {
+    const now = new Date();
+    const y = now.getFullYear(), m = now.getMonth() + 1;
+    const mm = String(m).padStart(2, '0');
+    if (!document.getElementById('period_start').value) {
+      document.getElementById('period_start').value = `${y}-${mm}-01`;
+    }
+    if (!document.getElementById('period_end').value) {
+      const lastDay = new Date(y, m, 0).getDate();
+      document.getElementById('period_end').value = `${y}-${mm}-${lastDay}`;
+    }
+  })();
+</script>
+{% endblock %}

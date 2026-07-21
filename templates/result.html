@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}정산 결과 · {{ r.period_start }} ~ {{ r.period_end }}{% endblock %}
+
+{% block content %}
+<div class="page-header result-header">
+  <div>
+    <h1>
+      정산 대사 완료
+      {% if r.status == '정상' %}
+        <span class="badge badge-ok">정상</span>
+      {% else %}
+        <span class="badge badge-ng">확인필요</span>
+      {% endif %}
+    </h1>
+    <p class="page-desc">정산 기간: {{ r.period_start }} ~ {{ r.period_end }}</p>
+  </div>
+  <a href="/download/{{ run_id }}/result" class="btn-primary">
+    ⬇️ Excel 다운로드
+  </a>
+</div>
+
+<!-- 핵심 지표 카드 -->
+<div class="metric-grid">
+  <div class="metric-card">
+    <div class="metric-icon">📄</div>
+    <div class="metric-value">{{ r.kt_total }}</div>
+    <div class="metric-label">KT 건수</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-icon">📋</div>
+    <div class="metric-value">{{ r.pl_total }}</div>
+    <div class="metric-label">플랫폼 건수</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-icon">✅</div>
+    <div class="metric-value text-ok">{{ r.matched }}</div>
+    <div class="metric-label">정상 일치</div>
+  </div>
+  <div class="metric-card {% if r.missing > 0 %}metric-warn{% endif %}">
+    <div class="metric-icon">⚠️</div>
+    <div class="metric-value {% if r.missing > 0 %}text-ng{% else %}text-ok{% endif %}">{{ r.missing }}</div>
+    <div class="metric-label">플랫폼 누락</div>
+  </div>
+  <div class="metric-card {% if r.amount_diff > 0 %}metric-warn{% endif %}">
+    <div class="metric-icon">💰</div>
+    <div class="metric-value {% if r.amount_diff > 0 %}text-ng{% else %}text-ok{% endif %}">{{ r.amount_diff }}</div>
+    <div class="metric-label">금액 불일치</div>
+  </div>
+  <div class="metric-card {% if r.ret_unmatch > 0 %}metric-warn{% endif %}">
+    <div class="metric-icon">↩️</div>
+    <div class="metric-value {% if r.ret_unmatch > 0 %}text-ng{% else %}text-ok{% endif %}">{{ r.ret_unmatch }}</div>
+    <div class="metric-label">미확인 반품</div>
+  </div>
+</div>
+
+<!-- 정산 금액 요약 -->
+<div class="amount-banner">
+  <span class="amount-label">기간 내 정산금액 합계</span>
+  <span class="amount-value">{{ "{:,}".format(r.total_amount) }} 원</span>
+</div>
+
+<!-- 확인 필요 항목 -->
+{% if r.missing > 0 %}
+<div class="section">
+  <h2 class="section-title warn">⚠️ 플랫폼 누락 주문 ({{ r.missing }}건)</h2>
+  <p class="section-desc">KT 정산에는 있으나 플랫폼에 없는 주문입니다. 확인이 필요합니다.</p>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          {% for key in r.missing_rows[0].keys() %}
+            <th>{{ key }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in r.missing_rows %}
+        <tr class="row-warn">
+          {% for val in row.values() %}
+            <td>{{ val }}</td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% if r.amount_diff > 0 %}
+<div class="section">
+  <h2 class="section-title warn">💰 금액 불일치 ({{ r.amount_diff }}건)</h2>
+  <p class="section-desc">KT와 플랫폼 정산금액이 1원 이상 차이 나는 주문입니다.</p>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          {% for key in r.diff_rows[0].keys() %}
+            <th>{{ key }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in r.diff_rows %}
+        <tr class="row-diff">
+          {% for val in row.values() %}
+            <td>{{ val }}</td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% if r.status == '정상' %}
+<div class="section all-ok">
+  <div class="ok-icon">✅</div>
+  <h2>모든 대사 항목 정상</h2>
+  <p>플랫폼 누락 · 금액 불일치 · 미확인 반품이 모두 0건입니다.</p>
+</div>
+{% endif %}
+
+<!-- 요약 테이블 -->
+<div class="section">
+  <h2 class="section-title">📊 대사 결과 요약</h2>
+  <table class="summary-table">
+    <tr><td>KT 총 건수</td><td class="val-num">{{ r.kt_total }}</td><td></td></tr>
+    <tr><td>플랫폼 총 건수</td><td class="val-num">{{ r.pl_total }}</td><td></td></tr>
+    <tr class="{% if r.matched == r.kt_total %}ok-row{% endif %}">
+      <td>일반 주문 일치</td><td class="val-num text-ok">{{ r.matched }}</td><td>✅</td></tr>
+    <tr class="{% if r.missing > 0 %}ng-row{% endif %}">
+      <td>플랫폼 누락</td>
+      <td class="val-num {% if r.missing > 0 %}text-ng{% else %}text-ok{% endif %}">{{ r.missing }}</td>
+      <td>{% if r.missing > 0 %}▲ 확인필요{% else %}정상{% endif %}</td></tr>
+    <tr class="{% if r.amount_diff > 0 %}ng-row{% endif %}">
+      <td>금액 불일치</td>
+      <td class="val-num {% if r.amount_diff > 0 %}text-ng{% else %}text-ok{% endif %}">{{ r.amount_diff }}</td>
+      <td>{% if r.amount_diff > 0 %}▲ 확인필요{% else %}정상{% endif %}</td></tr>
+    <tr><td>반품 정상 처리</td><td class="val-num">{{ r.ret_matched }}</td><td></td></tr>
+    <tr class="{% if r.ret_unmatch > 0 %}ng-row{% endif %}">
+      <td>미확인 반품</td>
+      <td class="val-num {% if r.ret_unmatch > 0 %}text-ng{% else %}text-ok{% endif %}">{{ r.ret_unmatch }}</td>
+      <td>{% if r.ret_unmatch > 0 %}▲ 확인필요{% else %}정상{% endif %}</td></tr>
+    <tr><td>플랫폼에만 존재</td><td class="val-num">{{ r.pl_only }}</td><td></td></tr>
+  </table>
+</div>
+
+<div class="btn-row">
+  <a href="/" class="btn-secondary">← 새 정산 실행</a>
+  <a href="/download/{{ run_id }}/result" class="btn-primary">⬇️ Excel 다운로드</a>
+</div>
+
+{% endblock %}
