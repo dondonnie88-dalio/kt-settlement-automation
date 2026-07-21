@@ -22,3 +22,7 @@ Thumbs.db
 __pycache__/
 *.pyc
 .env
+
+# 웹 포털 런타임 디렉토리 (자동 생성)
+uploads/
+outputs/
