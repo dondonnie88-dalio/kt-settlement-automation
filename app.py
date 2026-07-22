@@ -1,13 +1,13 @@
 """
-app.py  ─  KT 정산 자동화 웹 포털
+app.py  ─  KT 정산 자동화 웹 포털  (v2.0)
 실행: python app.py
 접속: http://localhost:5000
 """
 
-import os, uuid, json, datetime
+import os, uuid, json, datetime, calendar
 from pathlib import Path
 from flask import (Flask, render_template, request, redirect, url_for,
-                   send_file, jsonify, flash)
+                   send_file, flash)
 from werkzeug.utils import secure_filename
 
 from settlement_web import WebSettlementRunner
@@ -27,6 +27,16 @@ def allowed_file(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXT
 
 
+def _save_upload(file_obj, run_dir: Path, prefix: str) -> str:
+    """업로드 파일을 run_dir 에 저장하고 절대 경로 반환. 빈 파일이면 빈 문자열."""
+    if not file_obj or not file_obj.filename:
+        return ""
+    suffix = Path(secure_filename(file_obj.filename)).suffix
+    dest = run_dir / f"{prefix}{suffix}"
+    file_obj.save(str(dest))
+    return str(dest)
+
+
 # ── 홈 / 업로드 폼 ───────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -36,22 +46,20 @@ def index():
 # ── 정산 실행 ─────────────────────────────────────────────────────
 @app.route("/run", methods=["POST"])
 def run_settlement():
-    # 파일 검증
     kt_file = request.files.get("kt_file")
     pl_file = request.files.get("pl_file")
+    mm_file = request.files.get("mm_file")   # 선택
+    rm_file = request.files.get("rm_file")   # 선택
 
+    # 필수 파일 검증
     if not kt_file or not kt_file.filename:
-        flash("KT 정산 파일을 선택해주세요.", "error")
-        return redirect(url_for("index"))
+        flash("KT 정산 파일을 선택해주세요.", "error"); return redirect(url_for("index"))
     if not pl_file or not pl_file.filename:
-        flash("플랫폼 정산 파일을 선택해주세요.", "error")
-        return redirect(url_for("index"))
+        flash("플랫폼 정산 파일을 선택해주세요.", "error"); return redirect(url_for("index"))
     if not allowed_file(kt_file.filename):
-        flash("Excel 파일(.xlsx / .xls)만 업로드 가능합니다.", "error")
-        return redirect(url_for("index"))
+        flash("Excel 파일(.xlsx / .xls)만 업로드 가능합니다.", "error"); return redirect(url_for("index"))
     if not allowed_file(pl_file.filename):
-        flash("Excel 파일(.xlsx / .xls)만 업로드 가능합니다.", "error")
-        return redirect(url_for("index"))
+        flash("Excel 파일(.xlsx / .xls)만 업로드 가능합니다.", "error"); return redirect(url_for("index"))
 
     # 기간 파싱
     period_mode = request.form.get("period_mode", "manual")
@@ -62,7 +70,6 @@ def run_settlement():
                 period_start = datetime.date(today.year, today.month, 1)
                 period_end   = datetime.date(today.year, today.month, 15)
             elif today.day == 1:
-                import calendar
                 y, m = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
                 period_start = datetime.date(y, m, 16)
                 period_end   = datetime.date(y, m, calendar.monthrange(y, m)[1])
@@ -77,37 +84,36 @@ def run_settlement():
         return redirect(url_for("index"))
 
     if period_start > period_end:
-        flash("시작일이 종료일보다 늦습니다.", "error")
-        return redirect(url_for("index"))
+        flash("시작일이 종료일보다 늦습니다.", "error"); return redirect(url_for("index"))
 
     # 파일 저장
     run_id  = str(uuid.uuid4())[:8]
     run_dir = UPLOAD_DIR / run_id
     run_dir.mkdir(parents=True)
+    out_dir = OUTPUT_DIR / run_id
 
-    kt_filename = "kt_raw" + Path(secure_filename(kt_file.filename)).suffix
-    pl_filename = "platform" + Path(secure_filename(pl_file.filename)).suffix
-    kt_path = run_dir / kt_filename
-    pl_path = run_dir / pl_filename
-    kt_file.save(str(kt_path))
-    pl_file.save(str(pl_path))
+    kt_path = _save_upload(kt_file, run_dir, "kt_raw")
+    pl_path = _save_upload(pl_file, run_dir, "platform")
+    mm_path = _save_upload(mm_file, run_dir, "mapping_master") if mm_file else ""
+    rm_path = _save_upload(rm_file, run_dir, "return_mapping") if rm_file else ""
 
     # 정산 실행
-    out_dir = OUTPUT_DIR / run_id
     try:
         runner = WebSettlementRunner(
-            kt_path      = str(kt_path),
-            pl_path      = str(pl_path),
+            kt_path      = kt_path,
+            pl_path      = pl_path,
             period_start = period_start,
             period_end   = period_end,
             output_dir   = str(out_dir),
+            mm_path      = mm_path,
+            rm_path      = rm_path,
         )
-        result = runner.run()
+        result = runner.run_web()
     except Exception as e:
         flash(f"정산 실행 중 오류가 발생했습니다: {e}", "error")
         return redirect(url_for("index"))
 
-    # 결과 저장 (JSON) — date/datetime 객체를 문자열로 변환
+    # 결과 저장 (JSON) — date/datetime 직렬화
     def _json_default(obj):
         if hasattr(obj, "isoformat"):
             return obj.isoformat()
@@ -125,12 +131,9 @@ def run_settlement():
 def show_result(run_id: str):
     result_json = OUTPUT_DIR / run_id / "result.json"
     if not result_json.exists():
-        flash("결과를 찾을 수 없습니다.", "error")
-        return redirect(url_for("index"))
-
+        flash("결과를 찾을 수 없습니다.", "error"); return redirect(url_for("index"))
     with open(result_json, encoding="utf-8") as f:
         result = json.load(f)
-
     return render_template("result.html", r=result, run_id=run_id)
 
 
@@ -138,17 +141,26 @@ def show_result(run_id: str):
 @app.route("/download/<run_id>/result")
 def download_result(run_id: str):
     out_dir = OUTPUT_DIR / run_id
-    files   = list(out_dir.glob("정산결과_*.xlsx"))
+    files   = list(out_dir.glob("*.xlsx"))
     if not files:
         return "파일을 찾을 수 없습니다.", 404
-    return send_file(str(files[0]),
-                     as_attachment=True,
-                     download_name=files[0].name)
+    # result_path가 JSON에 기록되어 있으면 우선 사용
+    result_json = out_dir / "result.json"
+    target = None
+    if result_json.exists():
+        with open(result_json, encoding="utf-8") as f:
+            meta = json.load(f)
+        rp = meta.get("result_path", "")
+        if rp and Path(rp).exists():
+            target = Path(rp)
+    if target is None:
+        target = files[0]
+    return send_file(str(target), as_attachment=True, download_name=target.name)
 
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  KT 정산 자동화 웹 포털")
+    print("  KT 정산 자동화 웹 포털  v2.0")
     print("  접속 주소: http://localhost:5000")
     print("=" * 55)
     app.run(debug=False, host="0.0.0.0", port=5000)

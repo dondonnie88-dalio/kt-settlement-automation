@@ -395,6 +395,35 @@ body {
   font-size: .8rem;
 }
 
+/* ── 선택 파일 영역 ─────────────────────────────────────── */
+.optional-files {
+  margin-top: .8rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.optional-files summary {
+  padding: .7rem 1rem;
+  cursor: pointer;
+  font-size: .9rem;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--bg);
+  user-select: none;
+}
+.optional-files summary:hover { background: var(--kt-light); }
+.optional-inner { padding: .8rem; display: flex; flex-direction: column; gap: .6rem; }
+.file-upload-area.opt { border-style: dashed; padding: .9rem .8rem; }
+.opt-badge {
+  font-size: .7rem;
+  background: var(--kt-light);
+  color: var(--kt-blue);
+  padding: .1rem .4rem;
+  border-radius: 3px;
+  font-weight: 600;
+  margin-left: .3rem;
+}
+
 /* ── 반응형 ────────────────────────────────────────────── */
 @media (max-width: 600px) {
   .input-row { flex-direction: column; }

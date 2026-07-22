@@ -34,6 +34,28 @@
           <input type="file" id="pl_file" name="pl_file" accept=".xlsx,.xls,.xlsm"
                  onchange="showName(this,'plName')" style="display:none" required>
         </div>
+
+        <details class="optional-files">
+          <summary>선택 파일 (매핑·반품)</summary>
+          <div class="optional-inner">
+            <div class="file-upload-area opt" onclick="document.getElementById('mm_file').click()">
+              <div class="file-icon">🗂️</div>
+              <div class="file-label">소싱그룹 매핑파일 <span class="opt-badge">선택</span></div>
+              <div class="file-hint">mapping_master.xlsx · 관리회계·담당자 매핑</div>
+              <div class="file-name" id="mmName">선택 안 함</div>
+              <input type="file" id="mm_file" name="mm_file" accept=".xlsx,.xls,.xlsm"
+                     onchange="showName(this,'mmName')" style="display:none">
+            </div>
+            <div class="file-upload-area opt" onclick="document.getElementById('rm_file').click()">
+              <div class="file-icon">↩️</div>
+              <div class="file-label">반품 매핑파일 <span class="opt-badge">선택</span></div>
+              <div class="file-hint">return_mapping.xlsx · 반품 자동매칭 실패 시 사용</div>
+              <div class="file-name" id="rmName">선택 안 함</div>
+              <input type="file" id="rm_file" name="rm_file" accept=".xlsx,.xls,.xlsm"
+                     onchange="showName(this,'rmName')" style="display:none">
+            </div>
+          </div>
+        </details>
       </div>
     </div>
 
