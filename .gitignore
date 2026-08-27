@@ -22,3 +22,23 @@ Thumbs.db
 __pycache__/
 *.pyc
 .env
+
+# delivery_eta 파이프라인 출력 (자동 생성)
+delivery_eta/*.csv
+delivery_eta/eda_report.txt
+delivery_eta/risk_check_report.txt
+delivery_eta/phase1_report.txt
+delivery_eta/recency_diagnosis.txt
+delivery_eta/growth_vendor_flags.txt
+delivery_eta/category_granularity_check.txt
+delivery_eta/calendar_anomaly_report.txt
+delivery_eta/holiday_adjustment_report.txt
+delivery_eta/phase3_batch_vendor_candidates.txt
+delivery_eta/kraljic_delivery_risk_report.txt
+delivery_eta/sla_gap_report.txt
+delivery_eta/procurement_delay_flags.txt
+
+# 보고자료 산출물 (자동 생성, 템플릿 제외)
+보고자료/*.xlsx
+보고자료/*.docx
+!보고자료/minimal_template.docx
