@@ -29,7 +29,7 @@
 """
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
 from statistics import median
@@ -59,6 +59,13 @@ CORE_WATCHLIST = {
 CHASSIS_FAMILIES = {"VR4", "VR10"}
 BAND_TARGETS = [("8GHz", 2), ("8GHz", 4), ("11GHz", 2), ("11GHz", 4)]
 VARIATION_THRESHOLD = 0.30
+# IAP3(VR4/VR10 chassis) 구성 표에는 이 계열이 아닌 품목을 넣지 않는다. 장비계열이 명시적으로
+# 다른 값(CTR8312/8540/8740, WTM4200/4500/4500XT 등)이면 주파수 표기가 없더라도 '공통성 품목'으로
+# 보지 않고 제외한다(WTM4500 NODE LICENSE가 11GHz_IAP3_2+0에 혼입된 사례로 확인된 문제 수정).
+# WBX/WTM은 extract_family_key()가 별도 계열 키를 붙이지 않으므로 품목군으로 함께 걸러낸다.
+INCOMPATIBLE_FAMILIES = {"CTR8312", "CTR8540", "CTR8740", "WTM4200", "WTM4500", "WTM4500XT",
+                          "INUe", "ODU300", "ODU600"}
+INCOMPATIBLE_GROUPS = {"WBX", "WTM"}
 
 
 CATEGORY_MAP = {
@@ -369,6 +376,12 @@ def main():
                 # 보고 포함하되, 다른 대역으로 명시 태깅된 품목만 제외한다.
                 if ln_freq not in (freq, "") or ln["수량"] <= 0:
                     continue
+                # 주파수 태그가 없다고 해서 전부 '공통 품목'은 아니다 - CTR8312/8540/8740,
+                # WTM4200/4500/4500XT, WBX처럼 VR4/VR10 IAP3 계열과 무관한 다른 장비군이
+                # 같은 이벤트에 섞여 있으면(예: 결합윈도우가 CTR 전용 이벤트를 함께 묶은 경우)
+                # 명시적으로 다른 계열/품목군인 품목은 제외한다.
+                if info.get("장비계열") in INCOMPATIBLE_FAMILIES or info.get("품목군") in INCOMPATIBLE_GROUPS:
+                    continue
                 ratio = ln["수량"] / denom
                 item_obs[ln["K코드"]].append({
                     "윈도우ID": sig["윈도우ID"], "비율": ratio, "수량": ln["수량"], "기준": denom,
@@ -494,8 +507,25 @@ def main():
         completeness = ("부분(핵심 항목 일부만 확인)" if complete and (n_strong == 0)
                          else ("완성 근접(유력후보 존재)" if complete else "미완성(핵심 품목 일부 누락)"))
         price_ok = "가능(참고, 대표수량 있는 품목 한정)" if (n_named + n_strong + n_ref - n_var) > 0 else "불가"
-        ws_sum.append([sheet_name, n_total, n_named, n_strong, n_ref, n_var, completeness, price_ok,
-                       "핵심 품목군: " + ", ".join(sorted(core_present)) if core_present else "핵심 품목 없음"])
+        note = "핵심 품목군: " + ", ".join(sorted(core_present)) if core_present else "핵심 품목 없음"
+        # 유력 후보가 아직 없어도(독립반복 미확인), 단일 이벤트 하나에 핵심 품목이 여럿 함께
+        # 관측되면 그 자체로 주목할 만한 근거다(돈현님 피드백: "8GHz IAP3가 어느 구성에서
+        # 반복 관측되는가" 질문에 대한 1차 답). 이 단일 이벤트가 두 번째로 독립 반복되면
+        # '유력 후보'로 자동 승격되는 구조다.
+        if n_strong == 0:
+            window_hits = Counter()
+            for r in rows:
+                if r["분류"] == "핵심 필수품목" and r["대표수량"] != "변동, 공급사 확인 필요":
+                    for w in r["윈도우ID목록"].split(", "):
+                        if w and "+" not in w:
+                            window_hits[w] += 1
+            if window_hits:
+                top_window, top_count = window_hits.most_common(1)[0]
+                if top_count >= 5:
+                    note += (f" - 단일 이벤트 {top_window} 1건에서 핵심 품목 {top_count}개가 함께 "
+                             f"관측됨(해당 시트 참조). 아직 독립 반복 이벤트가 없어 '유력 후보'는 "
+                             f"아니지만, 공급사 확인 시 우선순위가 높은 후보.")
+        ws_sum.append([sheet_name, n_total, n_named, n_strong, n_ref, n_var, completeness, price_ok, note])
         if not complete:
             mark_fill(ws_sum, ws_sum.max_row, 7, ERROR_FILL)
     finalize_sheet(ws_sum, 1, len(headers_sum), ws_sum.max_row)
