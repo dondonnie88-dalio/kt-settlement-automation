@@ -14,6 +14,9 @@ kt_raw.xlsx
 platform.xlsx
 매출.xlsx
 
+# Aviat/Ceragon MW 분석 - 업로드 원본 사본(민감 데이터, 로컬 전용)
+input/
+
 # Windows 시스템 파일
 desktop.ini
 Thumbs.db

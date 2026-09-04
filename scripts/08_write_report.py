@@ -1,0 +1,282 @@
+"""
+9단계: 최종 종합보고서 작성
+입력: output/00~07 산출물 전체
+출력: output/08_구성방식별_가격분석_보고서.md
+
+각 단계 산출 파일에서 실제 수치를 다시 읽어 보고서에 반영한다(수작업 재입력으로 인한
+오류를 줄이기 위함). 서술은 이전 단계들에서 확인된 확정/추정/확인필요 구분을 그대로 유지한다.
+"""
+import sys
+from pathlib import Path
+
+import openpyxl
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+BASE_DIR = Path("/home/user/kt-settlement-automation")
+OUTPUT_DIR = BASE_DIR / "output"
+
+
+def ws_data(path, sheet, header_row=1):
+    wb = openpyxl.load_workbook(OUTPUT_DIR / path, data_only=True)
+    ws = wb[sheet]
+    headers = [c.value for c in ws[header_row]]
+    idx = {h: i for i, h in enumerate(headers) if h is not None}
+    rows = [r for r in ws.iter_rows(min_row=header_row + 1, values_only=True)]
+    return idx, rows
+
+
+def main():
+    lines = []
+
+    # ---- 4장: Aviat 213종 ----
+    idx1, rows1 = ws_data("01_Aviat_213종_정규화.xlsx", "품목정규화")
+    group_counts = {}
+    for r in rows1:
+        g = r[idx1["품목군"]]
+        group_counts[g] = group_counts.get(g, 0) + 1
+    n_issue = sum(1 for r in rows1 if r[idx1["데이터품질이슈"]])
+    idx1q, rows1q = ws_data("01_Aviat_213종_정규화.xlsx", "데이터품질_이슈")
+
+    # ---- 5장: 발주이력 ----
+    idx2, rows2 = ws_data("02_Aviat_발주이력_정제.xlsx", "정제데이터")
+    idx2s, rows2s = ws_data("02_Aviat_발주이력_정제.xlsx", "주문요약")
+    summary2 = {r[0]: r[1] for r in rows2s if r and r[0]}
+
+    # ---- 6장: 이벤트 ----
+    idx3, rows3 = ws_data("03_Aviat_발주이벤트_분석.xlsx", "이벤트요약", header_row=3)
+    n_events = len(rows3)
+    n_bulk = sum(1 for r in rows3 if r[idx3["복수현장일괄발주후보"]] == "유력")
+    n_expand = sum(1 for r in rows3 if r[idx3["증설후보"]] == "유력")
+
+    # ---- 7장: BoM 추정 ----
+    idx4, rows4 = ws_data("04_Aviat_구성방식별_표준BoM_추정.xlsx", "구성요약")
+    cfg_summary = {r[idx4["구성방식"]]: r for r in rows4}
+
+    # ---- 8장: 공급사 회신 ----
+    idx5, rows5 = ws_data("05_Aviat_공급사회신_검증.xlsx", "회신현황_요약")
+    reply_summary = {r[0]: r[1] for r in rows5 if r and r[0]}
+
+    # ---- 9장: Ceragon ----
+    idx6, rows6 = ws_data("06_Ceragon_구성방식별_BoM_정리.xlsx", "품목마스터")
+    n_active = sum(1 for r in rows6 if r[idx6["품목상태"]] == "활성")
+    n_deleted = sum(1 for r in rows6 if r[idx6["품목상태"]] == "삭제가능")
+    n_new = sum(1 for r in rows6 if r[idx6["품목상태"]] == "신규코드(코드 미부여)")
+    idx6b, rows6b = ws_data("06_Ceragon_구성방식별_BoM_정리.xlsx", "구성별_총액")
+
+    # ---- 10장: 비교 ----
+    idx7, rows7 = ws_data("07_Aviat_Ceragon_구성가격비교.xlsx", "직접대응_품목")
+
+    lines.append("# 08. 구성방식별 가격분석 보고서\n")
+    lines.append("작성일: 2026-09-04 (자동 생성, 각 단계 산출 파일의 실제 수치를 재조회하여 반영)\n")
+
+    lines.append("\n## 1. 분석 목적\n")
+    lines.append(
+        "KT commerce가 공급받는 Microwave 전송장비 중 Aviat 계열 213종 계약품목의 과거 발주이력을 "
+        "분석하여 2+0/4+0/6+0/8+0 구성방식별 표준 BoM을 추정하고, Ceragon 계열의 기존 구성방식별 "
+        "BoM·단가 자료와 비교해 협상에 활용할 수 있는 근거자료를 만드는 것을 목적으로 한다. "
+        "모든 결론은 확정/추정/확인 필요 3단계로 구분해 표기한다.\n"
+    )
+
+    lines.append("\n## 2. 사용 파일\n")
+    lines.append(
+        "| 파일 | 역할 |\n|---|---|\n"
+        "| 510331d5-...MDMmini_digital_microwave_213...xlsx | Aviat 213종 계약품목(등록요청/내역서) |\n"
+        "| 3b46dc94-...20252026...xlsx | Aviat 2025~2026년 발주이력(주문현황, 245건) |\n"
+        "| 7cb45e7e / 70bc7482-Aviat_MDM_...BoM...xlsx | Aviat 공급사 작성용 표준BoM 양식(빈 템플릿, 2건 업로드 모두 동일) |\n"
+        "| 3e5cc5b3-...MW...List_Kt...DSIT...xlsx | Ceragon 품목별 단가(493건: 활성/삭제가능/신규코드) |\n"
+        "| 60d6ff1e-...MW...BoM...DSIT...9...xlsx | Ceragon 주파수·구성방식별 BoM(8GHz/11GHz) |\n"
+        "| 75064b39-...260825_100530_1.docx | KT-Ceragon 신규총판 미팅 녹취록(Naver Clova Note 자동전사) |\n"
+        "\n세부 구조조사 결과는 `output/00_입력파일_구조조사.md` 참조.\n"
+    )
+
+    lines.append("\n## 3. 데이터 품질\n")
+    lines.append(
+        f"- Aviat 213종 계약품목: K코드 213개, 중복·빈값 0건(확정, `01_Aviat_213종_정규화.xlsx` 원본정리 시트).\n"
+        f"- 품명/설명 주파수 표기 불일치·오타: {sum(1 for r in rows1q if r and r[4] and '주파수' in str(r[4]))}건 "
+        f"확인(순번20 '111G' 오타, 순번48 '6GHz용 W/G'인데 설명은 '8Ghz용' — 데이터품질_이슈 시트).\n"
+        f"- 계약품목 vs 업체작성양식 K코드 재부여 의심 4건(K9090176/K9093723/K9188156/K9090179 ↔ "
+        f"K9210278~281, 동일 순번·동일 품명, 코드만 상이).\n"
+        f"- 발주이력 245건: 날짜/숫자 변환 오류 0건, 금액 불일치 0건, 취소·반품·교환 0건"
+        f"(`02_Aviat_발주이력_정제.xlsx` 주문요약).\n"
+        f"- 발주이력 K코드 매핑률: 원본 그대로 91.4%(224/245), 상품코드 기반 보정(구코드→신코드 "
+        f"대응 포함) 시 100%(245/245) — 보정분은 '추정' 등급.\n"
+        f"- Ceragon 품목 493건 중 활성 {n_active}건, 삭제가능(6~7년 미출고) {n_deleted}건, "
+        f"신규코드(미부여) {n_new}건.\n"
+        f"- 회의록(⑦ 파일)은 자동 음성전사로 용어 오기 가능성이 있어 모든 인용은 '확인 필요' 등급으로 처리.\n"
+    )
+
+    lines.append("\n## 4. Aviat 213종 품목 구성\n")
+    top_groups = sorted(group_counts.items(), key=lambda x: -x[1])
+    lines.append(
+        "품목군 분류(24종, `01_Aviat_213종_정규화.xlsx` 품목정규화/품목군별_요약 시트, 키워드 기반 규칙 분류=추정):\n\n"
+        "| 품목군 | 품목수 |\n|---|---|\n" +
+        "\n".join(f"| {g} | {c} |" for g, c in top_groups) +
+        f"\n\n장비 계열은 크게 (1) HAX-Eclipse/ODU300·600 계열, (2) WTM4200/4500(XT) 일체형 계열, "
+        f"(3) VR4/VR10(IAP3 ODU, OBC2) 패킷 마이크로웨이브 계열, (4) CTR8312/8540/8740 계열로 "
+        f"관찰되며(추정, 원본에 '장비계열' 필드가 별도로 없어 품명 패턴 기반), CTR 8312는 세부규격에 "
+        f"'2+0 패킷형 IDU', CTR 8540은 '8+0 패킷형 IDU'라고 명시되어 있다(확정).\n"
+    )
+
+    lines.append("\n## 5. Aviat 발주이력 특징\n")
+    lines.append(
+        f"- 총 {summary2.get('총 처리 행 수')}건, 주문일자 범위 {summary2.get('주문일자 범위')}.\n"
+        f"- 주문자 고유값 {summary2.get('주문자 고유값 수')}명, 부서 고유값 {summary2.get('부서 고유값 수')}개, "
+        f"배송지 고유값 {summary2.get('배송지 고유값 수')}곳으로 매우 집중되어 있음.\n"
+        f"- 빌딩명/국사명/프로젝트명 등 현장 식별 보조 필드는 245건 전부 공란(확정) → 배송지만으로 "
+        f"실제 설치 국소를 특정할 수 없음.\n"
+        f"- 주문자 '이상*'(188건)과 '이상헌'(42건)은 이메일 패턴상 동일인일 가능성이 있으나 부서가 "
+        f"달라 병합하지 않음(확인 필요).\n"
+        f"- 취소/반품/교환 0건, 판매단가×수량=판매금액 불일치 0건(확정).\n"
+    )
+
+    lines.append("\n## 6. 발주 이벤트 분류\n")
+    lines.append(
+        f"- 1차 이벤트(동일 주문번호) 245건은 결합키가 전부 1:1이라 사실상 무의미(확정) — 주문번호가 "
+        f"이미 품목행 단위로 발급되는 시스템 구조.\n"
+        f"- 2차 이벤트 후보(동일 주문일자+주문자+부서+배송지) {n_events}건 도출.\n"
+        f"- 이 중 대량일괄발주(창고성/복수현장 물량 혼재 의심) {n_bulk}건 — 예: 2025-06-04 이벤트는 "
+        f"'HAX_IDU/ODU간 IF 케이블,1Meter'(K9090174) 수량 7,500개, 'HAX_Arrestor KIT' 204개 등 "
+        f"단일 링크로 보기 어려운 수량이 관측됨(확정, 수량은 원본 그대로).\n"
+        f"- 증설 유력 후보 {n_expand}건(신규 Chassis 없이 ODU/License/Interface Card만 추가된 소규모 이벤트).\n"
+        f"- 신규설치 '유력' 단독 판정은 0건 — 대부분의 이벤트가 대량/복수대역 혼재 성격이라 순수한 "
+        f"'신규설치'로 확정하기 어려움(확인 필요).\n"
+        f"- 후속발주 연결 체인 1개 발견('이상*'/그룹시설팀/경기 안양시 배송지, 2025-06-04~12-27 "
+        f"사이 8개 이벤트가 반복). 세부 내용은 `03_Aviat_발주이벤트_분석.xlsx` 후속발주_후보 시트 참조.\n"
+    )
+
+    lines.append("\n## 7. Aviat 2+0·4+0·6+0·8+0 BoM 추정 결과\n")
+    lines.append(
+        "앵커 품목(구성 표기가 원본에 직접 확인되는 품목) 식별 결과:\n\n"
+        "| 구성방식 | 앵커품목수 | 관련품목수 | 확정후보 | 유력후보 | 참고후보 | 판단불가 |\n|---|---|---|---|---|---|---|\n" +
+        "\n".join(
+            f"| {cfg} | {cfg_summary[cfg][idx4['앵커품목수']]} | {cfg_summary[cfg][idx4['관련품목수(공통제외)']]} | "
+            f"{cfg_summary[cfg][idx4['확정후보']]} | {cfg_summary[cfg][idx4['유력후보']]} | "
+            f"{cfg_summary[cfg][idx4['참고후보']]} | {cfg_summary[cfg][idx4['판단불가']]} |"
+            for cfg in ["2+0", "4+0", "6+0", "8+0"]
+        ) +
+        "\n\n- 2+0: CTR 8312 1RU Chassis(K9188144, 세부규격 '2+0 패킷형 IDU')가 유일한 확정 앵커이며, "
+        "발주이력 근거가 1건(2025-11-11, EVT-009)뿐이라 companion 품목 대부분 '판단 불가'.\n"
+        "- 4+0/8+0: WBX 채널수 표기(8/11/4GHz 각 대역의 '4 CHNNEL/CHANNEL', '8 CHNNEL/CHANNEL')로 "
+        "6개/7개 앵커를 확정. 발주이력상 실제 수량 근거는 4GHz 대역(2025-09-17=4+0, 2025-09-18=8+0 "
+        "이벤트)에서만 확인되어, 8GHz/11GHz WBX는 '계약서에 존재함'만 확정이고 수량은 확인 필요.\n"
+        "- 6+0: Aviat 계약품목·발주이력 어디에서도 6+0을 직접 지시하는 표기가 없어 앵커 0건 "
+        "(확인 필요 — 공급사에 6+0 구성 자체의 존재 여부부터 확인 요청).\n"
+    )
+
+    lines.append("\n## 8. 공급사 회신과 추정 결과 비교\n")
+    lines.append(
+        f"- 업체작성 표준BoM양식(⑦ 파일) K코드 213개 중 {reply_summary.get('코드 일치(공통)')}개는 계약품목과 "
+        f"일치, {reply_summary.get('업체양식에만 있는 코드(구코드 추정)')}개는 코드가 상이(구코드 잔존 의심).\n"
+        f"- 2+0/4+0/6+0/8+0 수량 기재: {reply_summary.get('2+0 수량 기재됨')} / "
+        f"{reply_summary.get('4+0 수량 기재됨')} / {reply_summary.get('6+0 수량 기재됨')} / "
+        f"{reply_summary.get('8+0 수량 기재됨')} — 전부 미기재(회신 전 빈 템플릿, 확정).\n"
+        f"- 따라서 7단계에서 만든 발주이력 기반 추정치 25건은 전부 '발주실적은 있으나 공급사 BoM "
+        f"미기재(회신 대기)'로 분류됨(`05_Aviat_공급사회신_검증.xlsx` 구성별_비교 시트).\n"
+    )
+
+    lines.append("\n## 9. Ceragon 구성방식별 BoM 요약\n")
+    total_qty_by_cfg = {}
+    for r in rows6b:
+        cfg = r[idx6b["표준화구성표기"]]
+        total_qty_by_cfg.setdefault(cfg, 0)
+        total_qty_by_cfg[cfg] += r[idx6b["총수량"]] or 0
+    lines.append(
+        f"- 전체 품목 493건(활성 {n_active}, 삭제가능 {n_deleted}, 신규코드 {n_new}) — "
+        f"3e5cc5b3 파일 '구분' 병합그룹 기준(확정).\n"
+        f"- 8GHz/11GHz 대역 모두 2:0/4:0/6:0/8:0 × SD/Non_SD 16개 조합의 수량 매트릭스가 "
+        f"완비되어 있음(확정, A+B국소 합산하여 1개 링크 총수량 산출).\n"
+        f"- 구성방식별 총수량(8GHz+11GHz 합계): " +
+        ", ".join(f"{cfg}={qty}" for cfg, qty in sorted(total_qty_by_cfg.items())) + ".\n"
+        f"- 6GHz 및 8GHz_11GHz 공용 'Configuration SW Package' 라이선스가 2+0~8+0까지 전부 "
+        f"명시적으로 존재(확정, 예: K9210610 시트 row488 'CER_6GHz_6+0_SD_Configuration SW "
+        f"Package'). 단 6GHz는 하드웨어 수량 매트릭스가 공란이라 라이선스 비용만 확인 가능.\n"
+        f"- '기존가격' vs '가격인하' 시트 간 수량 매트릭스는 99.4% 동일하며, Hybrid cable "
+        f"3종(40/50/60m) 및 XPIC-SD Hybrid cable 20m 품목만 최신판에서 수량이 0으로 변경됨"
+        f"(`06_Ceragon_구성방식별_BoM_정리.xlsx` 데이터비교_기존vs인하 시트).\n"
+    )
+
+    lines.append("\n## 10. Aviat와 Ceragon 구성 총액 비교\n")
+    lines.append(
+        "2+0/4+0/6+0/8+0 × 8GHz/11GHz × SD/Non_SD 총 16개 조합을 검토했으나, Aviat 측의 신뢰할 "
+        "만한 발주이력 근거가 4GHz 대역에 집중되어 있어 **동일 주파수 대역 기준의 구성 총액 비교는 "
+        "16개 조합 전부 비교불가로 처리**했다(`07_Aviat_Ceragon_구성가격비교.xlsx` 구성총액_비교/"
+        "비교불가 시트). 다른 대역끼리 억지로 묶어 비교하지 않는다는 원칙(요청서 10.2절)을 지켰다.\n"
+    )
+
+    lines.append("\n## 11. 가격차가 큰 구성\n")
+    lines.append(
+        "구성 총액 비교가 불가능하므로, 개별 품목 직접대응 비교(3건) 결과만 보고한다:\n\n"
+        "| 비교대상 | Aviat 판매가 | Ceragon 단가 | 비고 |\n|---|---|---|---|\n" +
+        "\n".join(
+            f"| {r[idx7['비교대상']]} | {r[idx7['Aviat 판매가']]:,} | {r[idx7['Ceragon 단가(판매가/계약단가)']]:,.0f} | "
+            f"{r[idx7['비고']][:40]}... |"
+            for r in rows7
+        ) +
+        "\n\n3건 모두 Ceragon 단가가 Aviat 판매가보다 낮게 나타나지만, 공급사 미팅 녹취에서 "
+        "'저구성 손실분을 설치자재 단가로 보정한다'는 발언이 있었던 만큼(확인 필요) 이 차이를 "
+        "그대로 협상 근거로 사용하기보다 정식 견적 확인이 필요하다.\n"
+    )
+
+    lines.append("\n## 12. 직접 비교가 어려운 구성\n")
+    lines.append(
+        "- 8GHz/11GHz 2+0~8+0 전체: Ceragon은 수량 매트릭스가 있으나 Aviat 발주이력 근거가 없음.\n"
+        "- 4GHz 2+0~8+0: Aviat는 WBX 기반 근거가 있으나(4+0/8+0), Ceragon 제공 자료에는 4GHz 대역 "
+        "수량 매트릭스가 없음.\n"
+        "- 6+0 전 구간: 양측 모두 하드웨어 수량 근거가 없음(Ceragon은 라이선스 가격만 존재).\n"
+        "- SD 구성: Aviat는 SD/Non-SD 공식 구분이 확인되지 않아(요청서 2.3절 원칙) Ceragon의 명확한 "
+        "SD/Non_SD 구분과 직접 대응시키지 않음.\n"
+    )
+
+    lines.append("\n## 13. 공급사 추가 확인사항\n")
+    lines.append(
+        "`05_Aviat_공급사회신_검증.xlsx`(확인필요사항 시트)와 `07_Aviat_Ceragon_구성가격비교.xlsx`"
+        "(공급사확인사항 시트)에 정리된 항목을 통합하면:\n\n"
+        "1. Aviat 표준BoM 양식에 2+0/4+0/6+0/8+0 수량 기재 및 회신.\n"
+        "2. 계약품목-업체양식 K코드 재부여 4건 정정.\n"
+        "3. 6+0 구성 존재 여부 자체 확인(Aviat).\n"
+        "4. Aviat 8GHz/11GHz 대역 구성별 수량, Ceragon 4GHz 대역 지원 여부.\n"
+        "5. Ceragon 매입가(KT 조달원가) 별도 제공.\n"
+        "6. Ceragon 6GHz Configuration SW Package와 하드웨어 수량 매트릭스 간의 연결 관계.\n"
+        "7. 직접대응 SFP 3건의 정확한 사양(온도/거리) 일치 여부.\n"
+    )
+
+    lines.append("\n## 14. 협상에 바로 활용 가능한 자료\n")
+    lines.append(
+        "- Ceragon 8GHz/11GHz 2+0~8+0 구성별 총수량·금액표(`06...` 구성별_총액 시트) — 공급사가 "
+        "제시한 구성별 물량 체계를 그대로 확인할 수 있는 확정 자료.\n"
+        "- Aviat 계약품목 213종의 품목군별 판매/매입 금액 및 마진율 요약(`01...` 품목군별_요약 시트).\n"
+        "- SFP 등 직접대응 품목 3건의 단가 비교(`07...` 직접대응_품목 시트).\n"
+        "- CTR8312=2+0, CTR8540=8+0이라는 확정 정보와 WBX 4/8채널 앵커 목록(`04...` 2+0_BoM/"
+        "4+0_BoM/8+0_BoM 시트) — 공급사에 구성별 회신을 요청할 때 기준선으로 제시 가능.\n"
+    )
+
+    lines.append("\n## 15. 분석 한계\n")
+    lines.append(
+        "1. Aviat 발주이력 245건 대부분이 창고성 대량발주 또는 복수 대역·복수 현장 물량이 혼재된 "
+        "이벤트여서, '1개 링크 기준' 표준 BoM 수량은 근사치이며 공급사 회신으로 재검증이 필요하다.\n"
+        "2. 공급사 작성 표준BoM 양식이 아직 빈 템플릿이라 발주이력 기반 추정치를 검증할 공식 "
+        "비교 대상이 없다.\n"
+        "3. Aviat와 Ceragon의 신뢰할 만한 데이터가 겹치는 주파수 대역이 없어 구성 총액 비교를 "
+        "수행하지 못했다(개별 품목 3건만 비교).\n"
+        "4. 6+0 구성은 Aviat·Ceragon 양측 모두 하드웨어 수량 근거가 없다.\n"
+        "5. 배송지/현장 식별 필드(빌딩명·국사명·프로젝트명)가 발주이력에 전혀 없어, 실제 설치 "
+        "국소나 A/B국소 구분을 임의로 만들지 않았다(요청서 2.2/2.3절 원칙 준수).\n"
+        "6. 공급사 미팅 녹취록은 자동 음성전사본으로, 인용된 모든 내용은 공식 서면 확인 전까지 "
+        "'확인 필요' 등급으로만 취급했다.\n"
+        "7. 품목군/장비계열 등 텍스트 기반 분류는 규칙 기반 추정이며, rapidfuzz 등 문자열 유사도만으로 "
+        "장비나 구성을 확정하지 않는다는 원칙에 따라 명시적 키워드 매칭만 사용했다(실제로는 정규식 "
+        "기반 규칙만 사용, rapidfuzz는 사용하지 않음).\n"
+    )
+
+    out_path = OUTPUT_DIR / "08_구성방식별_가격분석_보고서.md"
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+    print("=== 9단계: 최종 종합보고서 작성 완료 ===")
+    print(f"입력: output/01~07 산출 파일 전체")
+    print(f"생성 파일: {out_path}")
+    print(f"보고서 섹션 수: 15개")
+
+
+if __name__ == "__main__":
+    main()
