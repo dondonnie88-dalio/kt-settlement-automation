@@ -59,12 +59,18 @@ def classify_item_group(name: str, spec: str) -> str:
         return "Modem"
     if has("MC-MV", "NCC", "NPC", "TERM-MV", "AUX-A", "제어 및", "관리 및 전원"):
         return "CPU/Control"
-    if has("GBE", "STM1", "STM-1", "E1", "DAC", "MSE-A", "이더넷 카드", "인터페이스"):
-        return "Interface Card"
-    if has("CHASSIS", "IDU", "셀프", "SHELF"):
+    # CHASSIS/CABLE 판정을 Interface Card보다 먼저 검사한다: 'VR4 1RU CHASSIS'처럼
+    # 세부규격에 흔한 서술어 '인터페이스'(예: 'TDM/IP 인터페이스 정합 IDU')가 들어 있으면
+    # Interface Card 규칙(키워드 '인터페이스')이 먼저 걸려 정작 섀시 자체가 Interface Card로
+    # 잘못 분류되는 문제가 있었다(예: VR4/VR10 CHASSIS). 'IDU'는 'HAX_IDU-INUe-FAN' 같은
+    # INUe 계열 카드/부속 이름에도 공통 접두어로 들어가 너무 광범위하므로 CHASSIS 판정
+    # 키워드에서 제외하고, 'SHELF'/'CHASSIS'(원본 오타 'CHSSIS' 포함)/'셀프'만 사용한다.
+    if has("CHASSIS", "CHSSIS", "SHELF", "셀프"):
         return "IDU/Chassis"
     if has("CABLE", "케이블", "점퍼"):
         return "Cable"
+    if has("GBE", "STM1", "STM-1", "E1", "DAC", "MSE-A", "이더넷 카드", "인터페이스"):
+        return "Interface Card"
     if has("CONNECTOR", "커넥터", "ADAPTER", "아답터", "콘넥터"):
         return "Connector"
     if has("TOOL", "공구"):

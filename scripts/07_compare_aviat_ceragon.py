@@ -4,10 +4,13 @@
 출력: output/07_Aviat_Ceragon_구성가격비교.xlsx
 
 핵심 제약(요약 시트에도 기록):
-- Ceragon 자료는 8GHz/11GHz 대역만 제공되고 4GHz/6GHz는 라이선스 단가 일부를 제외하면 수량
-  매트릭스가 없음. 반면 Aviat 발주이력에서 근거가 가장 뚜렷한 구성(4+0/8+0)은 4GHz 대역
-  WBX 사례였음 → 동일 주파수 대역에서 양측 모두 신뢰할 만한 구성 총액을 갖는 조합이 없어,
-  '구성 총액' 단위의 직접 비교는 대부분 '비교불가'로 처리한다(임의로 다른 대역을 묶지 않음).
+- 돈현님 피드백(2026-09-04) 반영: 8GHz/11GHz는 Aviat·Ceragon 양측 자료에 모두 존재하므로
+  "대역이 겹치지 않는다"고 쓰지 않는다. 04v2(8GHz/11GHz IAP3 재분석)에서 Aviat 측 2+0/4+0
+  후보 근거(유력/참고 후보)를 확인했으나 완성된 표준 BoM 수준은 아니어서, '대역은 겹치지만
+  Aviat 완성 BoM 미확정으로 구성 총액 비교가 보류됨'으로 정리한다. 반면 6+0/8+0(8/11GHz)은
+  그 배수 자체를 시사하는 Aviat 발주이력이 전혀 없어 비교 불가이고, Aviat의 4GHz(WBX/CTR
+  텍스트 앵커) 전 구성은 Ceragon 쪽에 4GHz 수량 자료 자체가 없어 비교 불가다. 이 세 가지는
+  서로 다른 사유이므로 시트별로 구분해 기록한다(임의로 다른 대역을 묶어 비교하지 않는다).
 - Ceragon 파일에는 단가(공급단가)만 있고 별도의 '매입가'가 없다. 과제 지침에 따라 이 값은
   '판매가 또는 계약단가'로만 사용하고, 매입가 비교에는 사용하지 않는다
   ('Ceragon 매입가 미제공'으로 표시).
@@ -24,6 +27,7 @@ from xlsx_style import finalize_sheet, ERROR_FILL, REVIEW_FILL, CONFIRMED_FILL, 
 BASE_DIR = Path("/home/user/kt-settlement-automation")
 OUTPUT_DIR = BASE_DIR / "output"
 SRC_AVIAT_BOM = OUTPUT_DIR / "04_Aviat_구성방식별_표준BoM_추정.xlsx"
+SRC_AVIAT_BOM_V2 = OUTPUT_DIR / "04_Aviat_구성방식별_표준BoM_추정_v2.xlsx"
 SRC_CERAGON_BOM = OUTPUT_DIR / "06_Ceragon_구성방식별_BoM_정리.xlsx"
 
 CONFIGS = ["2+0", "4+0", "6+0", "8+0"]
@@ -73,6 +77,39 @@ def load_aviat_config_totals():
     return result
 
 
+def load_aviat_iap3_summary():
+    """04v2(8GHz/11GHz IAP3 재분석) 결과를 요약해, 04(v1)이 놓친 8/11GHz 후보 근거를
+    구성총액 비교 사유에 반영한다. 04v2는 2+0/4+0만 다루므로(6+0/8+0은 발주이력 근거 없음),
+    이 두 구성만 값을 채우고 나머지는 None으로 남긴다."""
+    wb = openpyxl.load_workbook(SRC_AVIAT_BOM_V2, data_only=True)
+    result = {}
+    for band in ["8GHz", "11GHz"]:
+        for cfg in ["2+0", "4+0"]:
+            ws = wb[f"{band}_IAP3_{cfg}"]
+            headers = [c.value for c in ws[1]]
+            idx = {h: i for i, h in enumerate(headers)}
+            n_total = n_strong = n_ref = 0
+            strong_sale_total = 0.0
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row[idx["K코드"]]:
+                    continue
+                n_total += 1
+                level = row[idx["판정수준"]]
+                if level == "유력 후보":
+                    n_strong += 1
+                    qty = row[idx["대표 수량(1개 링크=N ODU쌍 기준)"]]
+                    price = row[idx["판매단가"]] or 0
+                    if isinstance(qty, (int, float)):
+                        strong_sale_total += qty * price
+                elif level == "참고 후보":
+                    n_ref += 1
+            result[(band, cfg)] = {
+                "품목수": n_total, "유력후보": n_strong, "참고후보": n_ref,
+                "유력후보_참고총액": strong_sale_total if n_strong > 0 else None,
+            }
+    return result
+
+
 def load_ceragon_config_totals():
     wb = openpyxl.load_workbook(SRC_CERAGON_BOM, data_only=True)
     ws = wb["구성별_총액"]
@@ -110,6 +147,7 @@ def load_price_lookup(path, sheet, kcode_col, name_col, sale_col, buy_col=None):
 
 def main():
     aviat_cfg = load_aviat_config_totals()
+    aviat_iap3 = load_aviat_iap3_summary()
     ceragon_cfg = load_ceragon_config_totals()
     aviat_price = load_price_lookup(OUTPUT_DIR / "01_Aviat_213종_정규화.xlsx", "원본정리",
                                      "K코드", "품명", "판매단가", "매입단가")
@@ -126,23 +164,54 @@ def main():
                 "직접 비교 가능 여부", "사유"]
     ws1.append(headers1)
     for cfg in CONFIGS:
-        av = aviat_cfg[cfg]
         for band in ["8GHz", "11GHz"]:
             for sd in ["SD", "Non_SD"]:
                 cer = ceragon_cfg.get((band, cfg, sd))
                 r = ws1.max_row + 1
-                comparable = "아니오"
-                reason = (
-                    f"Aviat {cfg} 구성의 발주이력 근거는 4GHz 대역(WBX) 위주이며 {band} 대역 자체 "
-                    f"수량 근거가 없음(계약서 텍스트로 존재만 확인). Ceragon은 {band}/{sd} 데이터가 "
-                    f"있으나 대역이 달라 동일 링크 총액으로 합산 비교하지 않음."
-                )
+                iap3 = aviat_iap3.get((band, cfg))
+                if iap3 is None:
+                    # 6+0/8+0: 대역(8/11GHz) 자체는 Aviat에도 존재하나, 이 배수를 시사하는
+                    # 발주이력 근거가 전혀 없다(04v2 확인필요 시트 참조) - "대역이 다르다"가
+                    # 아니라 "이 배수의 구성표기·수량 근거 자체가 없다"가 정확한 사유다.
+                    aviat_band_note = f"{band} 자체는 Aviat 자료에도 존재하나, {cfg} 배수를 " \
+                                       "시사하는 발주이력 근거가 확인되지 않음(04v2 확인필요 시트 참조)"
+                    aviat_sale = None
+                    comparable = "아니오(근거 없음)"
+                    reason = (
+                        f"대역({band})은 Aviat·Ceragon 양측 자료에 모두 존재하므로 '대역이 겹치지 "
+                        f"않는다'고 표현하지 않는다. 다만 {cfg} 구성 자체를 시사하는 Aviat 발주이력이 "
+                        f"없어(04v2 재분석 결과 포함) 이 조합은 비교 대상이 될 수 없음."
+                    )
+                elif iap3["유력후보"] > 0:
+                    aviat_band_note = (f"{band} {cfg}: 04v2 재분석 결과 유력후보 {iap3['유력후보']}건/"
+                                        f"참고후보 {iap3['참고후보']}건(표준 BoM 확정 아님)")
+                    aviat_sale = iap3["유력후보_참고총액"]
+                    comparable = "보류(대역 겹침, Aviat 미확정)"
+                    reason = (
+                        f"대역({band})은 Aviat·Ceragon 양측에 모두 존재함(대역 자체는 겹침). 04v2 "
+                        f"재분석에서 {cfg} 구성의 핵심 품목 {iap3['유력후보']}건이 '유력 후보' 수준까지 "
+                        f"확인되었으나(반복 관측 비율 안정), 전체 품목({iap3['품목수']}건) 중 다수는 "
+                        f"아직 참고 후보 단계이고 완성된 표준 BoM으로 확정되지 않아, 구성 총액 단위의 "
+                        f"전면 비교는 보류한다. 왼쪽 '판매총액' 값은 유력후보 품목만의 부분 합계(참고용)"
+                        f"이며 Ceragon 쪽 전체 품목 총액과 직접 비교 가능한 값이 아니다."
+                    )
+                else:
+                    aviat_band_note = (f"{band} {cfg}: 04v2 재분석 결과 참고후보 {iap3['참고후보']}건만 "
+                                        "확인(반복 관측으로 뒷받침되는 유력 후보 없음)")
+                    aviat_sale = None
+                    comparable = "보류(대역 겹침, Aviat 근거 부족)"
+                    reason = (
+                        f"대역({band})은 Aviat·Ceragon 양측에 모두 존재함(대역 자체는 겹침). 다만 "
+                        f"04v2 재분석에서 {cfg} 구성 품목 대부분이 다중대역 혼재 윈도우 등으로 인해 "
+                        f"'참고 후보' 수준에 그쳐, 총액을 산출할 만큼의 근거가 아직 없음. 임의로 수량을 "
+                        f"채워 총액을 계산하지 않는다(공급사 확인 필요)."
+                    )
                 ws1.append([
-                    cfg, av["주파수"], av["판매총액"] or None, av["매입총액"] or None,
+                    cfg, aviat_band_note, aviat_sale, None,
                     band, sd, cer["인하금액합계"] if cer else None, "Ceragon 매입가 미제공",
                     comparable, reason,
                 ])
-                mark_fill(ws1, r, 9, ERROR_FILL)
+                mark_fill(ws1, r, 9, REVIEW_FILL if iap3 is not None else ERROR_FILL)
     for c in [3, 4, 7]:
         for r in range(2, ws1.max_row + 1):
             ws1.cell(row=r, column=c).number_format = FMT_AMOUNT
@@ -205,8 +274,13 @@ def main():
     ws4.append(["비교 유형", "내용", "Aviat", "Ceragon(판매가/계약단가로 사용)", "비고"])
     ws4.append(["개별품목(직접대응)", "SFP 등 직접대응 3건 평균 판매가 차이", "직접대응_품목 시트 참조",
                 "직접대응_품목 시트 참조", "3건 모두 Ceragon 단가가 낮게 나타남(확인 필요, 정식 견적 아님)"])
-    ws4.append(["구성총액(2+0~8+0)", "동일 대역·동일 구성 기준 총액 비교", "데이터 부족(4GHz 위주)",
-                "8GHz/11GHz 매트릭스 존재", "구성총액_비교 시트 전체가 '비교불가' - 근거 부족"])
+    ws4.append(["구성총액(2+0~8+0)", "동일 대역·동일 구성 기준 총액 비교",
+                "8GHz/11GHz 대역 자체는 존재(04v2 IAP3 재분석). 2+0/4+0은 유력/참고 후보 수준 "
+                "근거 있으나 완성 BoM 미확정, 6+0/8+0은 근거 자체 없음",
+                "8GHz/11GHz 매트릭스 존재(2+0~8+0 전 구성)",
+                "구성총액_비교 시트: 2+0/4+0(8·11GHz)은 '보류'(대역은 겹침, Aviat 미확정), "
+                "6+0/8+0(8·11GHz) 및 4GHz 전 구성(WBX/CTR 앵커)은 '비교불가' - 자세한 사유는 "
+                "구성총액_비교/비교불가 시트 참조"])
     finalize_sheet(ws4, 1, 5, ws4.max_row)
     ws4.column_dimensions["B"].width = 40
     ws4.column_dimensions["E"].width = 50
@@ -230,24 +304,37 @@ def main():
     ws5.column_dimensions["E"].width = 50
 
     # ---------------- 비교불가 ----------------
+    # 주의: 8GHz/11GHz는 Aviat·Ceragon 양측 자료에 모두 존재하므로(04v2 참조) "대역이 다르다"는
+    # 이 시트에 다시 쓰지 않는다. 2+0/4+0은 04v2에서 후보 근거가 있어 '불가'가 아니라 '보류'
+    # 상태이므로(구성총액_비교 시트 참조) 이 시트에는 올리지 않는다. 여기 남는 것은 (a) 6+0/8+0처럼
+    # 그 배수 자체를 시사하는 Aviat 발주이력이 전혀 없는 경우, (b) Ceragon 쪽에 4GHz 데이터 자체가
+    # 없어 Aviat의 4GHz(WBX/CTR 텍스트 앵커) 자료와 맞대볼 상대가 없는 경우, 두 가지뿐이다.
     ws6 = wb.create_sheet("비교불가")
     headers6 = ["구성방식", "대역 조합", "비교불가 사유"]
     ws6.append(headers6)
     for cfg in CONFIGS:
         for band in ["8GHz", "11GHz"]:
-            ws6.append([cfg, f"Aviat(4GHz 근거) vs Ceragon({band})",
-                        "동일 주파수 대역 기준 데이터가 양측 모두에 존재하지 않아 구성 총액 비교 불가"])
-        ws6.append([cfg, "Aviat(자체 4GHz) vs Ceragon(4GHz)",
-                    "Ceragon 제공 자료에 4GHz 대역 수량 매트릭스 자체가 없음(라이선스 단가 일부 제외)"])
+            if aviat_iap3.get((band, cfg)) is not None:
+                continue
+            ws6.append([cfg, f"Aviat({band}) vs Ceragon({band})",
+                        f"{band} 대역 자체는 Aviat 자료에도 존재하나(04v2 참조), {cfg} 배수를 시사하는 "
+                        "Aviat 발주이력 근거가 전혀 확인되지 않음(대역 불일치가 아니라 이 배수의 근거 "
+                        "부족 - 공급사 확인 필요)."])
+        ws6.append([cfg, "Aviat(WBX/CTR 텍스트 앵커, 4GHz 위주) vs Ceragon(4GHz)",
+                    "Ceragon 제공 자료에 4GHz 대역 수량 매트릭스 자체가 없음(라이선스 단가 일부 제외). "
+                    "이는 Ceragon 쪽 4GHz 데이터 부재가 원인이며, Aviat·Ceragon 대역이 전반적으로 "
+                    "겹치지 않는다는 뜻은 아니다(8GHz/11GHz는 양측에 모두 존재 - 구성총액_비교 시트 참조)."])
     finalize_sheet(ws6, 1, len(headers6), ws6.max_row)
-    ws6.column_dimensions["C"].width = 60
+    ws6.column_dimensions["C"].width = 70
 
     # ---------------- 공급사확인사항 ----------------
     ws7 = wb.create_sheet("공급사확인사항")
     ws7.append(["번호", "확인 요청 내용"])
     asks = [
-        "Aviat: 8GHz/11GHz 대역 각각의 2+0/4+0/6+0/8+0 구성 표준 BoM 수량 회신(현재 4GHz만 "
-        "발주이력 근거가 있어 Ceragon과 동일 대역 비교 불가).",
+        "Aviat: 8GHz/11GHz 2+0/4+0 구성에 대해 04v2 재분석(발주이력 기반)에서 식별된 유력/참고 "
+        "후보 품목·수량이 실제 표준 BoM과 일치하는지 확인 회신 요청. 아울러 6+0/8+0 구성이 "
+        "IAP3 계열(8/11GHz)에서 실제로 존재하는지, 존재한다면 표준 BoM 수량은 얼마인지 회신 요청"
+        "(현재 발주이력에는 이 배수를 시사하는 근거가 전혀 없음).",
         "Ceragon: 4GHz 대역 지원 여부 및 지원 시 구성별 BoM/단가 제공.",
         "Ceragon: '매입가'(KT 조달원가) 별도 제공 여부 - 현재 자료는 단가(공급가)만 존재.",
         "Ceragon: 6GHz 대역 'Configuration SW Package' 라이선스가 실제 하드웨어 구성과 어떻게 "
@@ -262,29 +349,44 @@ def main():
     # ---------------- 요약 ----------------
     ws8 = wb.create_sheet("요약")
     ws8.append(["항목", "내용"])
-    ws8.append(["비교 가능 범위", "개별 품목 단위 3건(SFP류)만 직접 비교 가능. 구성 총액(2+0~8+0) "
-                              "단위 비교는 Aviat·Ceragon 양측이 신뢰할 만한 데이터를 갖는 공통 주파수 "
-                              "대역이 없어 전량 비교불가로 처리."])
+    ws8.append(["비교 가능 범위", "개별 품목 단위 3건(SFP류)은 직접 비교 가능. 구성 총액(2+0~8+0) 단위 "
+                              "비교는: (1) 8GHz/11GHz는 Aviat·Ceragon 양측 자료에 모두 존재함(대역은 "
+                              "겹침 - 04v2 IAP3 재분석 참조). (2) 다만 Aviat 측 8GHz/11GHz 2+0/4+0 "
+                              "후보는 04v2에서 유력/참고 후보 수준까지만 확인되고 완성된 표준 BoM으로 "
+                              "확정되지 않아, 구성 총액 단위의 전면 비교는 보류함. (3) 6+0/8+0은 그 "
+                              "배수를 시사하는 Aviat 발주이력 근거 자체가 없어 비교 불가. (4) Aviat의 "
+                              "4GHz(WBX/CTR 텍스트 앵커) 전 구성은 Ceragon 쪽에 4GHz 수량 자료 자체가 "
+                              "없어 비교 불가. 요컨대 '대역이 겹치지 않는다'가 아니라 'Aviat 완성 BoM "
+                              "미확정으로 구성 총액 비교가 보류'된 상태다(자세한 내용은 구성총액_비교/ "
+                              "비교불가 시트 참조)."])
     ws8.append(["직접대응 3건 결과", "SFP류 3건 모두 Ceragon 단가가 Aviat 판매가보다 낮게 나타남(구체 "
                                 "수치는 직접대응_품목 시트 참조). 단, 이는 공식 견적이 아니라 참고용 "
                                 "단가 비교이므로 협상 근거로 바로 사용하지 말 것."])
     ws8.append(["가격축 원칙 준수", "Ceragon 매입가가 없어 Aviat 매입가는 어떤 Ceragon 수치와도 비교하지 "
                                 "않았음('Ceragon 매입가 미제공'으로 명시). 판매가 비교만 수행."])
-    ws8.append(["핵심 결론", "협상에 즉시 활용 가능한 것은 개별 SFP 단가 비교뿐이며, 구성 단위 총액 "
-                          "비교를 위해서는 5·6단계에서 식별된 확인필요 사항(Aviat 8/11GHz 회신, "
-                          "Ceragon 4GHz 지원여부, Ceragon 매입가)이 먼저 해소되어야 함."])
+    ws8.append(["핵심 결론", "협상에 즉시 활용 가능한 것은 개별 SFP 단가 비교뿐이다. 구성 단위 총액 "
+                          "비교를 진행하려면 04v2에서 이미 유력 후보 수준까지 확인된 11GHz 2+0 핵심 "
+                          "품목(VR4 CHASSIS/ODU LOW·HIGH/FAN-CV/Mounting Bracket/Node License)부터 "
+                          "Aviat에 표준 BoM 회신을 요청해 확정하고, 8GHz/11GHz 4+0 및 6+0/8+0 배수 "
+                          "존재 여부까지 함께 확인받는 것이 다음 단계다(다른 확인필요 사항은 "
+                          "5·6단계 결과 및 이 파일 공급사확인사항 시트 참조)."])
     finalize_sheet(ws8, 1, 2, ws8.max_row)
     ws8.column_dimensions["B"].width = 100
 
     out_path = OUTPUT_DIR / "07_Aviat_Ceragon_구성가격비교.xlsx"
     wb.save(out_path)
 
+    n_pending = sum(1 for row in ws1.iter_rows(min_row=2, values_only=True) if "보류" in row[8])
+    n_blocked = sum(1 for row in ws1.iter_rows(min_row=2, values_only=True) if "아니오" in row[8])
+
     print("=== 8단계: Aviat-Ceragon 구성가격 비교 완료 ===")
-    print(f"입력 파일: {SRC_AVIAT_BOM.name}, {SRC_CERAGON_BOM.name}")
+    print(f"입력 파일: {SRC_AVIAT_BOM.name}, {SRC_AVIAT_BOM_V2.name}, {SRC_CERAGON_BOM.name}")
     print(f"처리: 구성 {len(CONFIGS)}종 × 대역 2 × SD구분 2 = {ws1.max_row-1}개 조합 검토, 직접대응 품목 {len(DIRECT_PAIRS)}건")
     print(f"생성 파일: {out_path}")
     print("주요 검증 결과:")
-    print(f"  - 구성총액 비교 가능: 0건 / 비교불가: {ws1.max_row-1}건 (주파수 대역 불일치)")
+    print(f"  - 구성총액 비교(8/11GHz {ws1.max_row-1}개 조합): 확정 비교 0건 / 보류(대역 겹침, "
+          f"Aviat 미확정) {n_pending}건 / 비교불가(근거 없음) {n_blocked}건 - '대역 불일치'가 아님")
+    print(f"  - 4GHz(WBX/CTR 앵커) 전 구성: Ceragon에 4GHz 데이터가 없어 비교불가(비교불가 시트 참조)")
     print(f"  - 판매가 직접비교 가능 품목: {len(DIRECT_PAIRS)}건")
     print(f"  - 매입가 비교 가능 품목: 0건 (Ceragon 매입가 미제공)")
     print(f"  - 공급사 확인 필요 항목: {len(asks)}건")

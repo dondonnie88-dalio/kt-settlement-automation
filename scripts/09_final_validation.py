@@ -23,6 +23,7 @@ XLSX_FILES = [
     "02_Aviat_발주이력_정제.xlsx",
     "03_Aviat_발주이벤트_분석.xlsx",
     "04_Aviat_구성방식별_표준BoM_추정.xlsx",
+    "04_Aviat_구성방식별_표준BoM_추정_v2.xlsx",
     "05_Aviat_공급사회신_검증.xlsx",
     "06_Ceragon_구성방식별_BoM_정리.xlsx",
     "07_Aviat_Ceragon_구성가격비교.xlsx",
@@ -244,6 +245,12 @@ def main():
     print(f"확정 후보 수(전체 구성 합계): {total_conf}")
     print(f"유력 후보 수(전체 구성 합계): {total_strong}")
     print(f"판단 불가 수(전체 구성 합계): {total_na}")
+
+    idxv2, rowsv2 = ws_data("04_Aviat_구성방식별_표준BoM_추정_v2.xlsx", "구성요약")
+    print("\n[04v2 재분석] 8GHz/11GHz IAP3 구성(ODU LOW=HIGH 쌍수 기준, 돈현님 피드백 반영):")
+    for r in rowsv2:
+        print(f"  {r[idxv2['구성']]}: 관련품목 {r[idxv2['관련품목수']]}건 "
+              f"(유력 {r[idxv2['유력후보']]}, 참고 {r[idxv2['참고후보']]}) - {r[idxv2['완성 BoM 여부']]}")
 
     idxcb, rowscb = ws_data("06_Ceragon_구성방식별_BoM_정리.xlsx", "구성별_총액")
     print(f"Ceragon 비교 가능 구성 수(주파수×구성×SD): {len(rowscb)}")
