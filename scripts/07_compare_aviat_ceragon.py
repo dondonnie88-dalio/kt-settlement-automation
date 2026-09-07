@@ -356,6 +356,12 @@ def main():
         "Ceragon: '매입가'(KT 조달원가) 별도 제공 여부 - 현재 자료는 단가(공급가)만 존재.",
         "Ceragon: 6GHz 대역 'Configuration SW Package' 라이선스가 실제 하드웨어 구성과 어떻게 "
         "연결되는지(현재 수량 매트릭스 공란) 확인.",
+        "Ceragon: 6GHz 'Configuration SW Package' 8개 품목(신규코드-R484~R491) 설명에 적힌 "
+        "'Nnd-Activation' 표기가 2+0 SD=2nd부터 8+0 Non_SD=9nd까지 순차 증가하는데, 같은 라이선스 "
+        "계열인 8GHz/11GHz용 8개 품목(R492~R499)은 전부 '2nd-Activation'으로 동일하다 - 6GHz "
+        "쪽만 값이 순차 증가하는 것은 원본 가격표 작성 시 행 복사 과정에서 번호가 밀린 것으로 "
+        "보인다(2nd로 통일 여부 확인 필요, 6GHz 쪽 전체를 '2nd-Activation'으로 통일해야 하는지 "
+        "확인 요청).",
         "직접대응_품목 3건(SFP류)의 정확한 온도/거리 사양 일치 여부 재확인.",
     ]
     for i, a in enumerate(asks, start=1):
