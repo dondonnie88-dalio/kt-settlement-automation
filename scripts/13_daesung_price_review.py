@@ -91,7 +91,8 @@ def load_direct_pairs():
         if not row[idx["비교대상"]]:
             continue
         rows.append({
-            "비교대상": row[idx["비교대상"]], "Aviat 판매가": row[idx["Aviat 판매가"]],
+            "비교대상": row[idx["비교대상"]], "등급": row[idx["신뢰도 등급"]],
+            "Aviat 판매가": row[idx["Aviat 판매가"]],
             "Ceragon 단가": row[idx["Ceragon 단가(판매가/계약단가)"]], "비고": row[idx["비고"]],
         })
     return rows
@@ -110,11 +111,14 @@ def main():
                           "할 수 없다 - Aviat 참고치는 발주이력에서 반복 확인된 핵심 품목 몇 개일 뿐 "
                           "완성 링크가 아니고, 대성 금액은 케이블·커넥터·전원까지 포함한 완성 링크 "
                           "총액이라 범위 자체가 다르다. 아래 '직접대응 품목' 3건(SFP류, 코드 매칭 "
-                          "없이도 비교 가능)만 유일하게 신뢰할 수 있는 가격 비교점이다."])
+                          "없이도 비교 가능)이 그나마 신뢰할 수 있는 가격 비교점이나, 3건도 스펙 "
+                          "일치도가 서로 달라 등급을 나눠서 봐야 한다(신뢰도 등급 열 참조)."])
     ws1.append(["직접대응 3건 결과", "SFP류 3건 모두 대성(Ceragon) 단가가 Aviat 판매가보다 낮게 "
-                                "나타남(상세는 직접대응_품목 시트). 다만 정식 견적 비교가 아니라 "
-                                "가격표상 단가 비교이며, 온도·거리 등 세부 사양 완전 일치는 아직 "
-                                "미확인이다."])
+                                "나타나지만 신뢰도는 다르다: 실내용 1G SFP(준직접 비교, 설명 실질적"
+                                " 동일)가 가장 근접하고, 옥외용 1G SFP(조건부 비교, 온도등급 -40~"
+                                "+85℃ vs -30~+50℃로 다름)와 10G SFP+(참고 비교, 등급·거리 사양 "
+                                "모두 불일치 가능)는 그보다 약하다. 정식 견적 비교가 아니라 가격표상"
+                                " 단가 비교라는 한계도 여전하다(상세는 직접대응_품목 시트)."])
     ws1.append(["구성 총액 검토(6+0/8+0)", "대성은 6+0/8+0도 완성 BoM·단가를 제시했으나, Aviat "
                                        "발주이력에는 6+0/8+0(IAP3 계열)을 시사하는 근거가 전혀 없다 "
                                        "- 비교 대상 자체가 없으므로 이 두 구성은 대성 제시가를 검증할 "
@@ -183,11 +187,14 @@ def main():
 
     # ================= 직접대응_품목 =================
     ws4 = wb.create_sheet("직접대응_품목")
-    headers4 = ["비교대상", "Aviat 판매가", "대성(Ceragon) 단가", "비고"]
+    headers4 = ["비교대상", "신뢰도 등급", "Aviat 판매가", "대성(Ceragon) 단가", "비고"]
     ws4.append(headers4)
+    grade_fill = {"준직접 비교": CONFIRMED_FILL, "조건부 비교": REVIEW_FILL, "참고 비교": ERROR_FILL}
     for row in load_direct_pairs():
-        ws4.append([row["비교대상"], row["Aviat 판매가"], row["Ceragon 단가"], row["비고"]])
-    for c in [2, 3]:
+        r = ws4.max_row + 1
+        ws4.append([row["비교대상"], row["등급"], row["Aviat 판매가"], row["Ceragon 단가"], row["비고"]])
+        mark_fill(ws4, r, 2, grade_fill.get(row["등급"], REVIEW_FILL))
+    for c in [3, 4]:
         for r in range(2, ws4.max_row + 1):
             ws4.cell(row=r, column=c).number_format = FMT_AMOUNT
     finalize_sheet(ws4, 1, len(headers4), ws4.max_row)

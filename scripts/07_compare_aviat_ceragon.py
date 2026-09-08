@@ -33,16 +33,22 @@ SRC_CERAGON_BOM = OUTPUT_DIR / "06_Ceragon_구성방식별_BoM_정리.xlsx"
 CONFIGS = ["2+0", "4+0", "6+0", "8+0"]
 
 # 근거가 명확한 개별 품목 직접 대응 쌍(K코드는 Aviat / Ceragon 각각의 원본 K코드)
+# 신뢰도 등급(2026-09-08 추가, 외부 검토 반영): 3건 모두 '직접대응'으로 뭉뚱그리면 스펙
+# 일치도가 다른 걸 감춘다 - 준직접(스펙 설명이 실질적으로 같음) > 조건부(핵심 스펙 1개가
+# 다름, 조건부로만 참고) > 참고(등급 자체가 다를 수 있어 가격 비교 근거로는 약함) 순으로 구분한다.
 DIRECT_PAIRS = [
-    ("K9198328", "K9183522", "옥외(Outdoor)용 산업용 1G GbE SFP 광모듈",
+    ("K9198328", "K9183522", "옥외(Outdoor)용 산업용 1G GbE SFP 광모듈", "조건부 비교",
      "양측 모두 '옥외 Outdoor용 Optic Gbit Module' 설명이 동일. 온도사양은 Aviat -40~+85℃, "
-     "Ceragon -30~+50℃로 약간 다름(확인 필요)."),
-    ("K9210279", "K9178770", "실내용 1G GbE SFP 광모듈",
-     "양측 모두 실내형 1G Gigabit Ethernet SFP. 거리/파장 사양은 Aviat 자료에 명시되어 있지 않음"
+     "Ceragon -30~+50℃로 등급 자체가 달라(산업용 vs 일반 옥외용 추정) 조건부로만 참고"
      "(확인 필요)."),
-    ("K9198347", "K9197307", "10G SFP+ 광모듈(참고용, 완전 동일 사양 아님)",
-     "Aviat 품목은 산업용/실외 등급(-40~+85℃)이나 Ceragon 품목은 실외 등급 명시가 없어 "
-     "완전히 동일한 사양은 아님 - 참고용 비교(확인 필요)."),
+    ("K9210279", "K9178770", "실내용 1G GbE SFP 광모듈", "준직접 비교",
+     "양측 모두 실내형 1G Gigabit Ethernet SFP로 설명이 실질적으로 같아 3건 중 가장 근접한 "
+     "매칭이다. 다만 거리/파장 사양이 Aviat 자료에 명시되어 있지 않아 완전 일치 확인은 "
+     "아니다(확인 필요)."),
+    ("K9198347", "K9197307", "10G SFP+ 광모듈(참고용, 완전 동일 사양 아님)", "참고 비교",
+     "Aviat 품목은 산업용/실외 등급(-40~+85℃)이나 Ceragon 품목은 실외 등급 명시가 없고 "
+     "장거리(LR, 20km) 사양 - Aviat가 실제로 장거리 사양을 요구하는지도 불명확해 등급·거리"
+     " 모두 완전히 동일한 사양은 아님 - 참고 수준 비교(확인 필요)."),
 ]
 
 
@@ -251,25 +257,27 @@ def main():
 
     # ---------------- 직접대응_품목 ----------------
     ws3 = wb.create_sheet("직접대응_품목")
-    headers3 = ["비교대상", "Aviat K코드", "Aviat 품명", "Aviat 판매가", "Aviat 매입가",
+    headers3 = ["비교대상", "신뢰도 등급", "Aviat K코드", "Aviat 품명", "Aviat 판매가", "Aviat 매입가",
                 "Ceragon K코드", "Ceragon 품명", "Ceragon 단가(판매가/계약단가)",
                 "판매가 차액", "판매가 차이율", "비고"]
     ws3.append(headers3)
-    for aviat_k, ceragon_k, label, note in DIRECT_PAIRS:
+    grade_fill = {"준직접 비교": CONFIRMED_FILL, "조건부 비교": REVIEW_FILL, "참고 비교": ERROR_FILL}
+    for aviat_k, ceragon_k, label, grade, note in DIRECT_PAIRS:
         av = aviat_price.get(aviat_k, {})
         cer = ceragon_price.get(ceragon_k, {})
         r = ws3.max_row + 1
         ws3.append([
-            label, aviat_k, av.get("품명"), av.get("판매가"), av.get("매입가"),
+            label, grade, aviat_k, av.get("품명"), av.get("판매가"), av.get("매입가"),
             ceragon_k, cer.get("품명"), cer.get("판매가"), None, None, note,
         ])
-        ws3.cell(row=r, column=9).value = f"=D{r}-H{r}"
-        ws3.cell(row=r, column=10).value = f"=IF(D{r}=0,0,I{r}/D{r})"
-    for c in [4, 5, 8, 9]:
+        ws3.cell(row=r, column=10).value = f"=E{r}-I{r}"
+        ws3.cell(row=r, column=11).value = f"=IF(E{r}=0,0,J{r}/E{r})"
+        mark_fill(ws3, r, 2, grade_fill[grade])
+    for c in [5, 6, 9, 10]:
         for r in range(2, ws3.max_row + 1):
             ws3.cell(row=r, column=c).number_format = FMT_AMOUNT
     for r in range(2, ws3.max_row + 1):
-        ws3.cell(row=r, column=10).number_format = "0.0%"
+        ws3.cell(row=r, column=11).number_format = "0.0%"
     finalize_sheet(ws3, 1, len(headers3), ws3.max_row)
 
     # ---------------- 판매가_비교 ----------------
@@ -291,7 +299,7 @@ def main():
     # ---------------- 매입가_비교 ----------------
     ws5 = wb.create_sheet("매입가_비교")
     ws5.append(["비교 유형", "내용", "Aviat 매입가", "Ceragon 매입가", "비고"])
-    for aviat_k, ceragon_k, label, note in DIRECT_PAIRS:
+    for aviat_k, ceragon_k, label, grade, note in DIRECT_PAIRS:
         av = aviat_price.get(aviat_k, {})
         ws5.append([label, f"{aviat_k} vs {ceragon_k}", av.get("매입가"), "Ceragon 매입가 미제공",
                     "Ceragon 파일에는 공급단가만 있고 KT 매입가가 별도로 제공되지 않음"])
