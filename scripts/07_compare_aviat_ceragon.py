@@ -97,7 +97,10 @@ def load_aviat_iap3_summary():
                 level = row[idx["판정수준"]]
                 if level == "유력 후보":
                     n_strong += 1
-                    qty = row[idx["대표 수량(1개 링크=N ODU쌍 기준)"]]
+                    # 주의(2026-09-08 정정): '구성비 배수' 열은 N당 배수(예: 1=채널당 1개)이지
+                    # 링크 전체 수량이 아니다. 이걸 그대로 단가에 곱하면 2+0은 실제의 1/2, 4+0은
+                    # 1/4로 총액이 축소된다 - 반드시 '실제 수량(N+0 링크 전체)' 열을 써야 한다.
+                    qty = row[idx["실제 수량(N+0 링크 전체, 양쪽 사이트 합산)"]]
                     price = row[idx["판매단가"]] or 0
                     if isinstance(qty, (int, float)):
                         strong_sale_total += qty * price

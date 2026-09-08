@@ -350,7 +350,12 @@ def main():
     for freq, target_n in BAND_TARGETS:
         sheet_name = f"{freq}_IAP3_{target_n}+0"
         ws = wb.create_sheet(sheet_name)
-        headers = ["K코드", "품명", "품목군", "분류", "대표 수량(1개 링크=N ODU쌍 기준)", "판정수준",
+        # '대표 수량' 열은 N(ODU쌍수)당 배수(비율)이지 절대 수량이 아니다 - 예: rep=1은 '채널
+        # 1개당 1개'라는 뜻이며, 2+0(N=2) 링크 전체(양쪽 사이트 합산)에는 이 품목이 2개 필요하다는
+        # 뜻이다. 가격 계산 등에서 이 열을 그대로 단가에 곱하면 링크 총액을 N배 과소평가하게 되므로
+        # (2+0이면 1/2로, 4+0이면 1/4로 축소) '실제 수량(N+0 링크 전체)' 열을 별도로 둔다.
+        headers = ["K코드", "품명", "품목군", "분류", "구성비 배수(N당 배수, 절대수량 아님)",
+                   "실제 수량(N+0 링크 전체, 양쪽 사이트 합산)", "판정수준",
                    "관측횟수(윈도우, 중복포함)", "독립관측횟수(중복제외, 판정근거)",
                    "관측치 목록(수량/기준)", "근거 이벤트ID", "근거 주문번호",
                    "판매단가", "매입단가", "비고"]
@@ -407,6 +412,12 @@ def main():
             level_kr, rep, indep_obs = classify_confidence(basis_obs)
             level = "확정" if kcode in named_kcodes else ("유력 후보" if level_kr == "유력" else "참고 후보")
             rep_display = rep if rep is not None else "변동, 공급사 확인 필요"
+            # 대표수량은 'N당 배수'(예: rep=1 -> 이 품목은 ODU쌍 N개당 N개, 즉 채널 1개당 1개)이지
+            # N+0 링크 전체(양쪽 사이트 합산, 채널 N개 결합)에 필요한 실제 수량이 아니다. 다운스트림
+            # (07/11/13 등 가격 비교)에서 rep을 그대로 단가에 곱하면 실제 링크 총액을 N배 과소평가
+            # 하게 된다(2+0이면 1/2, 4+0이면 1/4로 축소) - 돈현님이 지적한 뒤 재검토해서 발견한 문제.
+            # 링크 전체 실제 수량 = rep * N 을 별도 열로 남겨 다운스트림이 이걸 쓰게 한다.
+            link_total_qty = round(rep * target_n, 4) if isinstance(rep, (int, float)) else "변동, 공급사 확인 필요"
             obs_list_str = "; ".join(f"{o['수량']}/{o['기준']}(={o['비율']:.2f})"
                                       + ("[다중대역]" if o["다중대역"] else "") for o in obs[:6])
             notes = []
@@ -418,7 +429,8 @@ def main():
             note = "; ".join(notes)
             rows.append({
                 "K코드": kcode, "품명": info.get("품명"), "품목군": info.get("품목군"),
-                "분류": category_of(info), "대표수량": rep_display, "판정수준": level,
+                "분류": category_of(info), "대표수량": rep_display,
+                "링크전체수량": link_total_qty, "판정수준": level,
                 "관측횟수": len(item_windows[kcode]), "독립관측횟수": len(indep_obs),
                 "관측치": obs_list_str,
                 "윈도우ID목록": ", ".join(sorted(item_windows[kcode])),
@@ -431,18 +443,20 @@ def main():
         for row in rows:
             r = ws.max_row + 1
             ws.append([row["K코드"], row["품명"], row["품목군"], row["분류"], row["대표수량"],
+                       row["링크전체수량"],
                        row["판정수준"], row["관측횟수"], row["독립관측횟수"], row["관측치"],
                        row["윈도우ID목록"], row["주문번호목록"], row["판매단가"], row["매입단가"],
                        row["비고"]])
             mark_font(ws, r, 1, ORIGIN_FONT)
             if row["판정수준"] == "유력 후보":
-                mark_fill(ws, r, 6, CONFIRMED_FILL)
+                mark_fill(ws, r, 7, CONFIRMED_FILL)
             elif row["대표수량"] == "변동, 공급사 확인 필요":
                 mark_fill(ws, r, 5, ERROR_FILL)
-                mark_fill(ws, r, 6, REVIEW_FILL)
+                mark_fill(ws, r, 6, ERROR_FILL)
+                mark_fill(ws, r, 7, REVIEW_FILL)
             else:
-                mark_fill(ws, r, 6, REVIEW_FILL)
-        for c in [12, 13]:
+                mark_fill(ws, r, 7, REVIEW_FILL)
+        for c in [13, 14]:
             for r in range(2, ws.max_row + 1):
                 ws.cell(row=r, column=c).number_format = FMT_AMOUNT
         finalize_sheet(ws, 1, len(headers), ws.max_row)

@@ -33,7 +33,9 @@ def load_aviat_strong_items():
     for row in ws.iter_rows(min_row=2, values_only=True):
         if row[idx["판정수준"]] != "유력 후보":
             continue
-        qty = row[idx["대표 수량(1개 링크=N ODU쌍 기준)"]]
+        # 2026-09-08 정정: 이 열은 N당 배수(비율)가 아니라 링크 전체(양쪽 사이트 합산) 실제
+        # 수량이다 - 이전 버전은 배수를 그대로 써서 2+0 기준 실제 수량의 절반으로 축소되어 있었음.
+        qty = row[idx["실제 수량(N+0 링크 전체, 양쪽 사이트 합산)"]]
         price = row[idx["판매단가"]] or 0
         rows.append({
             "K코드": row[idx["K코드"]], "품명": row[idx["품명"]], "품목군": row[idx["품목군"]],

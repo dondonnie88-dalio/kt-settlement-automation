@@ -34,6 +34,10 @@ def load_aviat_ref(band, cfg):
     ws = wb[f"{band}_IAP3_{cfg}"]
     headers = [c.value for c in ws[1]]
     idx = {h: i for i, h in enumerate(headers)}
+    # 2026-09-08 정정: '구성비 배수' 열은 N당 배수(비율, 예: 1=채널당 1개)이지 링크 전체
+    # 실제 수량이 아니다. 이전 버전은 이 배수를 그대로 단가에 곱해(또는 곱하지 않고 단가만
+    # 더해) 2+0은 실제 총액의 1/2, 4+0은 1/4로 축소 계산되어 있었다. '비율1.00 여부' 판정에는
+    # 여전히 배수 열을 쓰되, 금액 합산에는 반드시 '실제 수량(링크 전체)' 열을 곱한다.
     n_strong = n_ref = n_clean = 0
     clean_total = 0
     strong_total = 0
@@ -42,7 +46,8 @@ def load_aviat_ref(band, cfg):
         if not row[idx["K코드"]]:
             continue
         level = row[idx["판정수준"]]
-        rep = row[idx["대표 수량(1개 링크=N ODU쌍 기준)"]]
+        rep = row[idx["구성비 배수(N당 배수, 절대수량 아님)"]]
+        qty = row[idx["실제 수량(N+0 링크 전체, 양쪽 사이트 합산)"]]
         price = row[idx["판매단가"]] or 0
         if level == "유력 후보":
             n_strong += 1
@@ -50,10 +55,10 @@ def load_aviat_ref(band, cfg):
             n_ref += 1
         if rep == 1:
             n_clean += 1
-            clean_total += price
+            clean_total += qty * price if isinstance(qty, (int, float)) else price
             items.append((row[idx["품명"]], price))
-        if level == "유력 후보" and isinstance(rep, (int, float)):
-            strong_total += rep * price
+        if level == "유력 후보" and isinstance(qty, (int, float)):
+            strong_total += qty * price
     return {
         "유력후보": n_strong, "참고후보": n_ref,
         "정합품목수(비율1.00)": n_clean, "정합품목_참고총액": clean_total,
