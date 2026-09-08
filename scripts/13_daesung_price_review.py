@@ -47,7 +47,7 @@ def load_aviat_ref(band, cfg):
             continue
         level = row[idx["판정수준"]]
         rep = row[idx["구성비 배수(N당 배수, 절대수량 아님)"]]
-        qty = row[idx["실제 수량(N+0 링크 전체, 양쪽 사이트 합산)"]]
+        qty = row[idx["추정 수량(N+0 링크 전체 가정, 양쪽 사이트 합산)"]]
         price = row[idx["판매단가"]] or 0
         if level == "유력 후보":
             n_strong += 1
