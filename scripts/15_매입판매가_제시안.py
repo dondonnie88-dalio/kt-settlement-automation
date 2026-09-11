@@ -100,6 +100,12 @@ CORE_MARGIN = 0.02      # 판매가 대비, 10개 핵심 기능군 27개 품목 
 ACCESSORY_MARGIN = 0.03  # 안테나/방수/접지/보호/100M급 케이블 - 확인됨
 SFP_MARGIN = 0.05        # SFP·커넥터·서지보호 KIT - 3건 중 2건 정확 일치
 
+# 돈현님 요청(2026-09-11, 8차): 고객사에 협상 여유를 두고 처음부터 조금 높게 부르기 위한
+# 앵커링 버퍼. '제시 판매가'(KT 표준 마진 유지 최소선, 목표가/협상 마지노선)에 일괄 곱해
+# '고객 제시가(최초 견적)'를 만든다 - 8%p는 권장 범위(5~10%p)의 중간값이며, 이 상수만
+# 바꾸면 전체 시트에 일괄 반영된다.
+ANCHOR_BUFFER = 0.08
+
 
 def margin_rate(category):
     if category == "SFP":
@@ -236,6 +242,15 @@ def build_guide_sheet(wb, n_total, n_exact):
                               "계약에 쓰일 수 있으므로 삭제하지 않음), '타대역/구세대 추정' 열로 "
                               "표시해 이번 계약과 무관할 가능성이 높다는 걸 알 수 있게 했다 - "
                               "실제 계약 범위인지는 대성/Ceragon에 확인이 필요하다."),
+        ("고객 제시가(버퍼) 열(2026-09-11 추가)", f"돈현님 요청: 고객사와의 협상 여유를 위해 "
+                              f"처음부터 목표가보다 조금 높게 부른다. '제시 판매가(목표가)'는 "
+                              f"기존과 동일하게 KT 표준 마진을 유지하는 협상 마지노선이고, 여기에"
+                              f" {ANCHOR_BUFFER*100:.0f}%p를 얹은 '고객 제시가(최초견적)'를 새로"
+                              f" 추가했다 - 이 금액을 먼저 제시하고, 고객사가 인하를 요청하면 "
+                              f"목표가 선까지 내려가며 마무리하는 구조다. 버퍼 크기는 "
+                              f"ANCHOR_BUFFER 상수 하나만 바꾸면 전체 시트에 일괄 반영된다(권장"
+                              f" 범위 5~10%p 중 중간값 채택 - 너무 크면 시장 감각과 멀어지고 "
+                              f"너무 작으면 협상 카드로서 의미가 없다)."),
     ]
     for k, v in guide:
         ws.append([k, v])
@@ -245,8 +260,11 @@ def build_guide_sheet(wb, n_total, n_exact):
 
 def build_band_sheet(wb, band, cfg):
     ws = wb.create_sheet(f"{band}_{cfg}_제시안")
-    headers = ["기능분류", "Non_SD 매입액(대성 제시가)", "Non_SD 마진율", "Non_SD 제시 판매가", "Non_SD 마진액",
-               "SD 매입액(대성 제시가)", "SD 마진율", "SD 제시 판매가", "SD 마진액"]
+    headers = ["기능분류",
+               "Non_SD 매입액(대성 제시가)", "Non_SD 마진율", "Non_SD 제시 판매가(목표가)", "Non_SD 마진액",
+               f"Non_SD 고객 제시가(최초견적, 버퍼 {ANCHOR_BUFFER*100:.0f}%p)",
+               "SD 매입액(대성 제시가)", "SD 마진율", "SD 제시 판매가(목표가)", "SD 마진액",
+               f"SD 고객 제시가(최초견적, 버퍼 {ANCHOR_BUFFER*100:.0f}%p)"]
     ws.append(headers)
 
     totals = {}
@@ -262,7 +280,7 @@ def build_band_sheet(wb, band, cfg):
     cats = sorted(set(list(totals["Non_SD"].keys()) + list(totals["SD"].keys())),
                   key=lambda c: (func_cmp.CATEGORY_ORDER.index(c) if c in func_cmp.CATEGORY_ORDER else 99, c))
 
-    grand = {"Non_SD_매입": 0, "Non_SD_판매": 0, "SD_매입": 0, "SD_판매": 0}
+    grand = {"Non_SD_매입": 0, "Non_SD_판매": 0, "Non_SD_제시": 0, "SD_매입": 0, "SD_판매": 0, "SD_제시": 0}
     for cat in cats:
         label = func_cmp.CATEGORY_LABEL.get(cat, "⑫ 기타(케이블/커넥터/접지 등)")
         rate = margin_rate(None if cat == "기타" else cat)
@@ -271,24 +289,26 @@ def build_band_sheet(wb, band, cfg):
             buy = totals[sd].get(cat, 0)
             sale = buy / (1 - rate) if buy else 0
             margin_amt = sale - buy
-            row_vals += [buy or None, rate, sale or None, margin_amt or None]
+            anchor = sale * (1 + ANCHOR_BUFFER) if sale else 0
+            row_vals += [buy or None, rate, sale or None, margin_amt or None, anchor or None]
             grand[f"{sd}_매입"] += buy
             grand[f"{sd}_판매"] += sale
+            grand[f"{sd}_제시"] += anchor
         ws.append(row_vals)
         if cat == "기타":
             mark_fill(ws, ws.max_row, 1, REVIEW_FILL)
 
     r = ws.max_row + 1
     ws.append(["합계", grand["Non_SD_매입"] or None, None, grand["Non_SD_판매"] or None,
-               (grand["Non_SD_판매"] - grand["Non_SD_매입"]) or None,
+               (grand["Non_SD_판매"] - grand["Non_SD_매입"]) or None, grand["Non_SD_제시"] or None,
                grand["SD_매입"] or None, None, grand["SD_판매"] or None,
-               (grand["SD_판매"] - grand["SD_매입"]) or None])
+               (grand["SD_판매"] - grand["SD_매입"]) or None, grand["SD_제시"] or None])
     mark_fill(ws, r, 1, CONFIRMED_FILL)
 
-    for c in [2, 4, 5, 6, 8, 9]:
+    for c in [2, 4, 5, 6, 7, 9, 10, 11]:
         for rr in range(2, ws.max_row + 1):
             ws.cell(row=rr, column=c).number_format = FMT_AMOUNT
-    for c in [3, 7]:
+    for c in [3, 8]:
         for rr in range(2, ws.max_row + 1):
             ws.cell(row=rr, column=c).number_format = FMT_PERCENT
     finalize_sheet(ws, 1, len(headers), ws.max_row)
@@ -296,23 +316,25 @@ def build_band_sheet(wb, band, cfg):
 
     return {
         "band": band, "cfg": cfg,
-        "nonsd_매입": grand["Non_SD_매입"], "nonsd_판매": grand["Non_SD_판매"],
-        "sd_매입": grand["SD_매입"], "sd_판매": grand["SD_판매"],
+        "nonsd_매입": grand["Non_SD_매입"], "nonsd_판매": grand["Non_SD_판매"], "nonsd_제시": grand["Non_SD_제시"],
+        "sd_매입": grand["SD_매입"], "sd_판매": grand["SD_판매"], "sd_제시": grand["SD_제시"],
     }
 
 
 def build_summary_sheet(wb, results):
     ws = wb.create_sheet("전체_제시안_요약")
-    headers = ["구성", "Non_SD 매입총액(대성 제시가)", "Non_SD 제시 판매가(고객사)", "Non_SD 예상마진액",
-               "SD 매입총액(대성 제시가)", "SD 제시 판매가(고객사)", "SD 예상마진액"]
+    headers = ["구성", "Non_SD 매입총액(대성 제시가)", "Non_SD 목표가(마지노선)", "Non_SD 예상마진액",
+               f"Non_SD 고객 최초견적(버퍼 {ANCHOR_BUFFER*100:.0f}%p)",
+               "SD 매입총액(대성 제시가)", "SD 목표가(마지노선)", "SD 예상마진액",
+               f"SD 고객 최초견적(버퍼 {ANCHOR_BUFFER*100:.0f}%p)"]
     ws.append(headers)
     for res in results:
         ws.append([
             f"{res['band']} {res['cfg']}",
-            res["nonsd_매입"], res["nonsd_판매"], res["nonsd_판매"] - res["nonsd_매입"],
-            res["sd_매입"], res["sd_판매"], res["sd_판매"] - res["sd_매입"],
+            res["nonsd_매입"], res["nonsd_판매"], res["nonsd_판매"] - res["nonsd_매입"], res["nonsd_제시"],
+            res["sd_매입"], res["sd_판매"], res["sd_판매"] - res["sd_매입"], res["sd_제시"],
         ])
-    for c in range(2, 8):
+    for c in range(2, 10):
         for r in range(2, ws.max_row + 1):
             ws.cell(row=r, column=c).number_format = FMT_AMOUNT
     finalize_sheet(ws, 1, len(headers), ws.max_row)
@@ -323,7 +345,8 @@ def build_full_catalog_sheet(wb):
     매입가/판매가를 정해야 한다'. 8개 기본 구성에 없는 나머지 품목도 언젠가 발주될 수
     있으므로, 대성이 제출한 카탈로그 전체(품목마스터 493종)에 마진율을 부여한다."""
     ws = wb.create_sheet("전체카탈로그_단가제시안(493종)")
-    headers = ["K코드", "품명", "매입단가(대성 인하단가)", "적용 마진율", "제시 판매단가",
+    headers = ["K코드", "품명", "매입단가(대성 인하단가)", "적용 마진율", "제시 판매단가(목표가)",
+               f"고객 제시단가(최초견적, 버퍼 {ANCHOR_BUFFER*100:.0f}%p)",
                "마진 분류", "계약범위 추정", "신뢰도"]
     ws.append(headers)
 
@@ -338,27 +361,28 @@ def build_full_catalog_sheet(wb):
         buy = row[midx["최종인하단가"]] or 0
         rate, label, scope, conf = classify_catalog_item(name)
         sale = buy / (1 - rate) if buy else 0
-        rows.append((kcode, name, buy, rate, sale, label, scope, conf))
+        anchor = sale * (1 + ANCHOR_BUFFER) if sale else 0
+        rows.append((kcode, name, buy, rate, sale, anchor, label, scope, conf))
 
     conf_order = {"확인됨": 0, "패턴 매칭 추정": 1}
     scope_order = {"8/11GHz 현재세대(확인됨)": 0, "8/11GHz 현재세대 추정": 1,
                    "비무선 제품(확인 필요)": 2, "타대역/구세대 추정(계약범위 확인 필요)": 3}
-    rows.sort(key=lambda r: (conf_order.get(r[7], 9), scope_order.get(r[6], 9), r[1]))
+    rows.sort(key=lambda r: (conf_order.get(r[8], 9), scope_order.get(r[7], 9), r[1]))
 
     n_confirmed = n_pattern = 0
-    for kcode, name, buy, rate, sale, label, scope, conf in rows:
+    for kcode, name, buy, rate, sale, anchor, label, scope, conf in rows:
         r = ws.max_row + 1
-        ws.append([kcode, name, buy or None, rate, sale or None, label, scope, conf])
+        ws.append([kcode, name, buy or None, rate, sale or None, anchor or None, label, scope, conf])
         if conf == "확인됨":
-            mark_fill(ws, r, 8, CONFIRMED_FILL)
+            mark_fill(ws, r, 9, CONFIRMED_FILL)
             n_confirmed += 1
         else:
-            mark_fill(ws, r, 8, REVIEW_FILL)
+            mark_fill(ws, r, 9, REVIEW_FILL)
             n_pattern += 1
         if scope.startswith("타대역") or scope.startswith("비무선"):
-            mark_fill(ws, r, 7, ERROR_FILL)
+            mark_fill(ws, r, 8, ERROR_FILL)
 
-    for c in [3, 5]:
+    for c in [3, 5, 6]:
         for r in range(2, ws.max_row + 1):
             ws.cell(row=r, column=c).number_format = FMT_AMOUNT
     for r in range(2, ws.max_row + 1):
@@ -393,9 +417,10 @@ def main():
     print("=== 15단계: 매입가/판매가 제시안 생성 완료 ===")
     print(f"마진 구조 검증: {n_exact}/{n_total}개 품목이 예상 마진율과 ±0.3%p 이내 일치")
     for res in results:
-        print(f"  - {res['band']} {res['cfg']}: Non_SD 매입 {res['nonsd_매입']:,.0f}원 → 제시 판매가 "
-              f"{res['nonsd_판매']:,.0f}원 | SD 매입 {res['sd_매입']:,.0f}원 → 제시 판매가 "
-              f"{res['sd_판매']:,.0f}원")
+        print(f"  - {res['band']} {res['cfg']}: Non_SD 매입 {res['nonsd_매입']:,.0f}원 → 목표가 "
+              f"{res['nonsd_판매']:,.0f}원 → 고객 최초견적 {res['nonsd_제시']:,.0f}원 | SD 매입 "
+              f"{res['sd_매입']:,.0f}원 → 목표가 {res['sd_판매']:,.0f}원 → 고객 최초견적 "
+              f"{res['sd_제시']:,.0f}원")
     print(f"생성 파일: {out_path}")
     print("※ 매입가는 대성 제시가 조건부 수용(13번 결론), 판매가는 KT commerce가 Aviat 계약에서 "
           "실제로 쓰는 마진구조(2%/3%/5%)를 적용한 최소 제시가입니다 - 전략적 가산은 별도 검토 필요.")
