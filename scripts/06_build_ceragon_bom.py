@@ -69,6 +69,32 @@ def load_item_status():
 
 PLACEHOLDER_CODES = {"신규코드", "추가코드"}
 
+# 2026-09-14: KT로부터 19개 '신규코드' placeholder 품목 전량에 정식 K코드를 받았다(품명
+# 기준 매칭 - 이 품목들은 원본 파일 K코드 열에 여전히 '신규코드'/'추가코드'만 적혀 있어
+# 코드 자체로는 구분이 안 됨). 원본 input 파일은 수정하지 않는 프로젝트 규칙에 따라, 여기서
+# 품명으로 매칭해 표시 코드만 정식 코드로 교체한다 - 수량/가격/품명 등 다른 값은 그대로다.
+NEW_KCODE_BY_NAME = {
+    "CER_6GHz_2+0_SD_Configuration SW Package": "K9212896",
+    "CER_6GHz_2+0_ Non SD_Configuration SW Package": "K9213016",
+    "CER_6GHz_4+0_SD_Configuration SW Package": "K9213017",
+    "CER_6GHz_4+0_Non SD_Configuration SW Package": "K9213018",
+    "CER_6GHz_6+0_SD_Configuration SW Package": "K9213019",
+    "CER_6GHz_6+0_Non SD_Configuration SW Package": "K9213020",
+    "CER_6GHz_8+0_SD_Configuration SW Package": "K9213021",
+    "CER_6GHz_8+0_Non SD_Configuration SW Package": "K9213022",
+    "CER_8GHz_11GHz_2+0_SD_Configuration SW Package": "K9213023",
+    "CER_8GHz_11GHz_2+0_ Non SD_Configuration SW Package": "K9213024",
+    "CER_8GHz_11GHz_4+0_SD_Configuration SW Package": "K9213025",
+    "CER_8GHz_11GHz_4+0_Non SD_Configuration SW Package": "K9213026",
+    "CER_8GHz_11GHz_6+0_SD_Configuration SW Package": "K9213027",
+    "CER_8GHz_11GHz_6+0_Non SD_Configuration SW Package": "K9213028",
+    "CER_8GHz_11GHz_8+0_SD_Configuration SW Package": "K9213029",
+    "CER_8GHz_11GHz_8+0_Non SD_Configuration SW Package": "K9213030",
+    "CER_Dhrtr-ETSI-Compact & ETSI-8 INST-KIT": "K9213031",
+    "CER_Dhrtr-WALL/SHLF KIT": "K9213032",
+    "CER_Dhrtr- AC/DC CONV": "K9213033",
+}
+
 
 def read_sheet_rows(ws, last_row):
     """행 번호(row)를 키로 사용한다. 'K코드' 열에 실제 K코드 대신 '신규코드' 같은 placeholder
@@ -80,14 +106,19 @@ def read_sheet_rows(ws, last_row):
         if not kcode_raw:
             continue
         kcode_raw = str(kcode_raw).strip()
+        name = ws.cell(row=r, column=3).value
         is_placeholder = kcode_raw in PLACEHOLDER_CODES
-        # '순번'(A열)이 이 19개 행에서는 전부 공란이라 순번으로는 구분이 안 되므로, 항상
-        # 고유한 행 번호를 붙여 서로 다른 신규 품목이 같은 표시코드로 충돌하지 않게 한다.
-        display_code = f"{kcode_raw}-R{r}" if is_placeholder else kcode_raw
+        new_code = NEW_KCODE_BY_NAME.get(name.strip()) if (is_placeholder and name) else None
+        if new_code:
+            display_code, is_placeholder = new_code, False
+        else:
+            # '순번'(A열)이 이 행들에서는 전부 공란이라 순번으로는 구분이 안 되므로, 항상
+            # 고유한 행 번호를 붙여 서로 다른 신규 품목이 같은 표시코드로 충돌하지 않게 한다.
+            display_code = f"{kcode_raw}-R{r}" if is_placeholder else kcode_raw
         rows[r] = {
             "K코드": display_code, "K코드_실제여부": not is_placeholder,
             "순번": ws.cell(row=r, column=1).value,
-            "품명": ws.cell(row=r, column=3).value,
+            "품명": name,
             "설명": ws.cell(row=r, column=4).value,
             "단위": ws.cell(row=r, column=5).value,
             "단가": ws.cell(row=r, column=6).value or 0,
