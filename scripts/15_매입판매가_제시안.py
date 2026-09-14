@@ -117,6 +117,20 @@ def margin_rate(category):
     return CORE_MARGIN
 
 
+def capped_sale(buy, rate, list_price):
+    """돈현님 지적(2026-09-14): 대성이 애초에 준 할인율이 우리 마진율(2~5%)보다 작은 품목은
+    '매입가/(1-마진율)'을 그대로 쓰면 대성의 할인 전 원래 정가(기존단가)보다도 비싸게
+    제시하는 값이 나온다(47개 품목에서 실제로 발생 확인). 고객에게 공급사 정가보다 비싸게
+    제시하는 건 있을 수 없으므로, 계산된 판매가가 기존단가를 넘으면 기존단가로 눌러
+    상한선을 둔다 - 이 경우 KT 마진은 표준(2~5%)보다 작아지지만, 정가 초과보다는 훨씬 낫다."""
+    if not buy:
+        return 0
+    sale = buy / (1 - rate)
+    if list_price and list_price > 0:
+        sale = min(sale, list_price)
+    return sale
+
+
 def verify_aviat_margin_structure():
     """01번 파일 전수 검산 - 이 파일의 핵심 전제(마진 구조)를 재현 가능하게 남긴다."""
     wb = openpyxl.load_workbook(SRC_AVIAT_213, data_only=True)
@@ -150,6 +164,7 @@ def load_ceragon_band(band, cfg, sd):
         rows.append({
             "품명": name, "K코드": row[idx["K코드"]],
             "매입액": row[idx["인하금액"]] or 0,
+            "기존금액": row[idx["기존금액"]] or 0,
             "카테고리": func_cmp.CERAGON_CATEGORY.get(name),
         })
     return rows
@@ -244,6 +259,20 @@ def build_guide_sheet(wb, n_total, n_exact):
                               "계약에 쓰일 수 있으므로 삭제하지 않음), '타대역/구세대 추정' 열로 "
                               "표시해 이번 계약과 무관할 가능성이 높다는 걸 알 수 있게 했다 - "
                               "실제 계약 범위인지는 대성/Ceragon에 확인이 필요하다."),
+        ("정가상한 규칙(2026-09-14 추가) - 중요한 버그 수정", "돈현님이 발견: 47개 품목에서 "
+                              "'제시 판매단가(목표가)'가 대성의 할인 전 원래 정가(기존단가)보다 "
+                              "높게 나오는 문제가 있었다 - 대성이 이 품목들에 준 할인율(1~2%)이 "
+                              "우리 마진율(2~5%)보다 작아서, '매입가/(1-마진율)' 계산값이 정가를 "
+                              "넘어버린 것이다(예: 정가 100원, 할인 1%→매입 99원, 마진 5%→"
+                              "99/0.95=104.2원 - 정가보다 비싼 값이 나옴). 공급사 정가보다 비싸게"
+                              " 고객에게 제시할 수는 없으므로, 계산값이 정가를 넘으면 정가로 "
+                              "상한을 둔다(이 경우 KT 마진은 표준보다 작아지지만 정가 초과보다는"
+                              " 낫다) - 해당 품목은 '가격 이상 여부' 열에 '정가상한 적용'으로 "
+                              "표시했다. 이 중 2건(RFUC-CPLR-8, RFUC-TWIST Kit-6)은 할인율 자체가"
+                              " 음수(할인 후 가격이 오히려 더 비쌈)인 데이터 이상치로 보이며, 두 "
+                              "품목의 '최종인하단가'가 정확히 같은 값(634,418원)이라 원본 가격표"
+                              " 작성 시 옆 행 값이 잘못 복사됐을 가능성이 높다 - 이건 '데이터 "
+                              "이상치'로 별도 표시했고 공급사 확인이 필요하다."),
         ("고객 제시가(버퍼) 열(2026-09-11 추가, 2026-09-14 조정)", f"돈현님 요청: 고객사와의 "
                               f"협상 여유를 위해 처음부터 목표가보다 조금 높게 부른다. '제시 "
                               f"판매가(목표가)'는 기존과 동일하게 KT 표준 마진을 유지하는 협상 "
@@ -277,8 +306,7 @@ def build_band_sheet(wb, band, cfg):
         by_cat = {}
         for r in rows:
             cat = r["카테고리"] or "기타"
-            by_cat.setdefault(cat, 0)
-            by_cat[cat] += r["매입액"]
+            by_cat.setdefault(cat, []).append(r)
         totals[sd] = by_cat
 
     cats = sorted(set(list(totals["Non_SD"].keys()) + list(totals["SD"].keys())),
@@ -289,9 +317,15 @@ def build_band_sheet(wb, band, cfg):
         label = func_cmp.CATEGORY_LABEL.get(cat, "⑫ 기타(케이블/커넥터/접지 등)")
         rate = margin_rate(None if cat == "기타" else cat)
         row_vals = [label]
+        capped_any = False
         for sd in ["Non_SD", "SD"]:
-            buy = totals[sd].get(cat, 0)
-            sale = buy / (1 - rate) if buy else 0
+            items = totals[sd].get(cat, [])
+            buy = sum(r["매입액"] for r in items)
+            # 품목별로 '판매가가 대성 정가(기존금액)를 넘지 않도록' 상한을 걸고 나서 합산한다
+            # (카테고리 합계에만 상한을 걸면 품목별 초과가 합계 안에 묻혀 안 보일 수 있음).
+            sale = sum(capped_sale(r["매입액"], rate, r["기존금액"]) for r in items)
+            if any(r["매입액"] and r["매입액"] / (1 - rate) > (r["기존금액"] or float("inf")) for r in items):
+                capped_any = True
             margin_amt = sale - buy
             anchor = sale * (1 + ANCHOR_BUFFER) if sale else 0
             row_vals += [buy or None, rate, sale or None, margin_amt or None, anchor or None]
@@ -301,6 +335,9 @@ def build_band_sheet(wb, band, cfg):
         ws.append(row_vals)
         if cat == "기타":
             mark_fill(ws, ws.max_row, 1, REVIEW_FILL)
+        if capped_any:
+            mark_fill(ws, ws.max_row, 4, ERROR_FILL)
+            mark_fill(ws, ws.max_row, 9, ERROR_FILL)
 
     r = ws.max_row + 1
     ws.append(["합계", grand["Non_SD_매입"] or None, None, grand["Non_SD_판매"] or None,
@@ -351,7 +388,7 @@ def build_full_catalog_sheet(wb):
     ws = wb.create_sheet("전체카탈로그_단가제시안(493종)")
     headers = ["K코드", "품명", "매입단가(대성 인하단가)", "적용 마진율", "제시 판매단가(목표가)",
                f"고객 제시단가(최초견적, 버퍼 {ANCHOR_BUFFER*100:.0f}%p)",
-               "마진 분류", "계약범위 추정", "신뢰도"]
+               "마진 분류", "계약범위 추정", "신뢰도", "가격 이상 여부"]
     ws.append(headers)
 
     wb_src = openpyxl.load_workbook(SRC_CERAGON, data_only=True)
@@ -363,20 +400,31 @@ def build_full_catalog_sheet(wb):
     for row in wsm.iter_rows(min_row=2, values_only=True):
         kcode, name = row[midx["K코드"]], row[midx["품명"]].strip()
         buy = row[midx["최종인하단가"]] or 0
+        list_price = row[midx["기존단가"]] or 0
         rate, label, scope, conf = classify_catalog_item(name)
-        sale = buy / (1 - rate) if buy else 0
+        # 돈현님 지적(2026-09-14): 대성 할인율이 우리 마진율보다 작으면 마진 계산값이 대성의
+        # 할인 전 정가(기존단가)보다 비싸질 수 있다 - 고객에게 공급사 정가보다 비싸게 제시할
+        # 수는 없으므로 기존단가를 상한으로 둔다.
+        raw_sale = buy / (1 - rate) if buy else 0
+        sale = capped_sale(buy, rate, list_price)
+        if list_price and buy > list_price:
+            anomaly = "데이터 이상치(할인 후 가격이 정가보다 높음 - 공급사 확인 필요)"
+        elif list_price and raw_sale > list_price:
+            anomaly = "정가상한 적용(대성 할인율<마진율이라 정가로 상한)"
+        else:
+            anomaly = ""
         anchor = sale * (1 + ANCHOR_BUFFER) if sale else 0
-        rows.append((kcode, name, buy, rate, sale, anchor, label, scope, conf))
+        rows.append((kcode, name, buy, rate, sale, anchor, label, scope, conf, anomaly))
 
     conf_order = {"확인됨": 0, "패턴 매칭 추정": 1}
     scope_order = {"8/11GHz 현재세대(확인됨)": 0, "8/11GHz 현재세대 추정": 1,
                    "비무선 제품(확인 필요)": 2, "타대역/구세대 추정(계약범위 확인 필요)": 3}
     rows.sort(key=lambda r: (conf_order.get(r[8], 9), scope_order.get(r[7], 9), r[1]))
 
-    n_confirmed = n_pattern = 0
-    for kcode, name, buy, rate, sale, anchor, label, scope, conf in rows:
+    n_confirmed = n_pattern = n_capped = n_anomaly = 0
+    for kcode, name, buy, rate, sale, anchor, label, scope, conf, anomaly in rows:
         r = ws.max_row + 1
-        ws.append([kcode, name, buy or None, rate, sale or None, anchor or None, label, scope, conf])
+        ws.append([kcode, name, buy or None, rate, sale or None, anchor or None, label, scope, conf, anomaly])
         if conf == "확인됨":
             mark_fill(ws, r, 9, CONFIRMED_FILL)
             n_confirmed += 1
@@ -385,6 +433,13 @@ def build_full_catalog_sheet(wb):
             n_pattern += 1
         if scope.startswith("타대역") or scope.startswith("비무선"):
             mark_fill(ws, r, 8, ERROR_FILL)
+        if anomaly.startswith("데이터 이상치"):
+            mark_fill(ws, r, 10, ERROR_FILL)
+            n_anomaly += 1
+        elif anomaly.startswith("정가상한"):
+            mark_fill(ws, r, 10, REVIEW_FILL)
+            mark_fill(ws, r, 5, REVIEW_FILL)
+            n_capped += 1
 
     for c in [3, 5, 6]:
         for r in range(2, ws.max_row + 1):
@@ -393,7 +448,7 @@ def build_full_catalog_sheet(wb):
         ws.cell(row=r, column=4).number_format = FMT_PERCENT
     finalize_sheet(ws, 1, len(headers), ws.max_row)
     ws.column_dimensions["B"].width = 45
-    return n_confirmed, n_pattern, len(rows)
+    return n_confirmed, n_pattern, len(rows), n_capped, n_anomaly
 
 
 def main():
@@ -408,7 +463,7 @@ def main():
         results.append(build_band_sheet(wb, band, cfg))
 
     build_summary_sheet(wb, results)
-    n_confirmed, n_pattern, n_catalog = build_full_catalog_sheet(wb)
+    n_confirmed, n_pattern, n_catalog, n_capped, n_anomaly = build_full_catalog_sheet(wb)
 
     sheet_order = (["안내", "마진구조_검증(01번 전수)"]
                    + [f"{b}_{c}_제시안" for b, c in BAND_CONFIGS]
@@ -430,6 +485,8 @@ def main():
           "실제로 쓰는 마진구조(2%/3%/5%)를 적용한 최소 제시가입니다 - 전략적 가산은 별도 검토 필요.")
     print(f"전체 카탈로그({n_catalog}종) 단가 제시안: 기능 확인됨 {n_confirmed}건, 품명 패턴 매칭 추정 "
           f"{n_pattern}건 - '전체카탈로그_단가제시안' 시트 참조.")
+    print(f"※ 대성 할인율<마진율이라 정가상한을 적용한 품목 {n_capped}건, 할인 후 가격이 오히려 "
+          f"정가보다 높은 데이터 이상치 {n_anomaly}건 - 각각 REVIEW/ERROR 색상으로 표시했습니다.")
 
 
 if __name__ == "__main__":
