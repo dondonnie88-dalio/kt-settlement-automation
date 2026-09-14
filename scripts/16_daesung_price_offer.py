@@ -21,6 +21,16 @@
     동일 정가를 가진 형제 품목(CPLR-6, TWIST Kit-8/11)의 실제 단가가 존재하므로
     이를 근거로 정확한 대체 단가를 제시할 수 있음(표준 할인율 0.8531 적용값과도
     사실상 일치 - 이중으로 검증됨).
+
+추가(2026-09-14): "493종 전품목에 대한 단가를 제시할 겁니다" 요청에 따라
+'전체493종_매입단가_제시' 시트를 추가함 - 카탈로그 전체 493개 품목에 대해 KT가
+매입단가로 제시할 값을 한 줄씩 나열한다(469건은 대성 제시가 그대로 수용, 5건은
+위 수정 제시, 19건은 정가 정보가 아예 없는 신규 SW패키지 품목이라 대성 제시가를
+그대로 수용하되 별도 표기). 5개 예외 외에 추가 이상치가 있는지도 확인하기 위해
+가격 있는 474개 품목 전체를 할인율 기준으로 재스캔했음 - 동일 정가/동일 계열
+품목끼리 최종 할인후 단가가 수렴하는 정상 패턴(예: 채널별로 정가는 다르지만
+할인후 단가는 동일하게 맞춰지는 필터/커플러류)과 진짜 이상치를 구분해, 기존
+5건 외 추가 이상치는 없음을 확인함.
 """
 import sys
 from pathlib import Path
@@ -118,13 +128,15 @@ def build_message_sheet(wb, rows):
         "있어 표기 오류로 판단됩니다. 동일 정가를 가진 형제 품목의 실제 적용 단가를 "
         "기준으로 아래와 같이 매입단가를 적용하겠습니다.\n"
         + "\n".join(line(r) for r in err) + "\n\n"
+        "위 5개 품목을 반영한 전체 493개 품목 매입단가 목록을 첨부(전체493종_매입단가_"
+        "제시 시트)합니다. 나머지 488개 품목은 귀사가 제시하신 단가를 그대로 적용합니다.\n\n"
         "이견 있으시면 회신 부탁드리며, 별도 회신 없을 시 위 단가로 진행하겠습니다.\n\n"
         "감사합니다."
     )
 
     guide = [
-        ("용도", "대성인포텍에 보낼 이메일/메신저 본문 초안. '제시단가_상세내역' 시트를 "
-                "첨부하거나 표를 붙여넣으면 된다."),
+        ("용도", "대성인포텍에 보낼 이메일/메신저 본문 초안. '제시단가_상세내역'과 "
+                "'전체493종_매입단가_제시' 시트를 첨부하거나 표를 붙여넣으면 된다."),
         ("메시지 초안", msg),
         ("참고(내부용, 대성에 보내지 않음)", "당초 검토 대상은 21개(안테나/마운트류 17개 "
                 "포함)였으나, 그 17개는 대성 단가표 내 동일 안테나 계열 41개 품목 전부와 "
@@ -171,13 +183,64 @@ def build_list_sheet(wb, rows):
         ws.cell(row=r, column=9).alignment = WRAP_TOP
 
 
+def build_full_offer_sheet(wb, override_rows):
+    by_code, idx = load_master()
+    override = {r["K코드"]: r for r in override_rows}
+
+    ws = wb.create_sheet("전체493종_매입단가_제시")
+    headers = ["품목상태", "K코드", "품명", "정가(기존단가)", "대성 제시단가(최종인하단가)",
+               "할인율", "KT 제시 매입단가", "조정구분", "비고"]
+    ws.append(headers)
+
+    n_accept = n_override = n_nolist = 0
+    for kcode, row in by_code.items():
+        status, name = row[idx["품목상태"]], row[idx["품명"]]
+        list_price, cur_price = row[idx["기존단가"]], row[idx["최종인하단가"]]
+
+        if kcode in override:
+            o = override[kcode]
+            offer, adj, note = o["KT_제시매입단가"], "수정 제시", o["근거"]
+            rate = o["대성_현재할인율"]
+            n_override += 1
+        elif list_price is None or cur_price is None:
+            offer, adj, note = cur_price, "정가 정보 없음 - 대성 제시가 그대로 수용", "신규 SW패키지 품목, 정가 기재 없어 자체 검증 불가"
+            rate = None
+            n_nolist += 1
+        else:
+            offer, adj, note = cur_price, "대성 제시가 수용", ""
+            rate = (list_price - cur_price) / list_price if list_price else None
+            n_accept += 1
+
+        rr = ws.max_row + 1
+        ws.append([status, kcode, name, list_price, cur_price, rate, offer, adj, note])
+        if kcode in override:
+            mark_fill(ws, rr, 7, CONFIRMED_FILL if override[kcode]["구분"] == "표기오류" else REVIEW_FILL)
+            mark_fill(ws, rr, 8, REVIEW_FILL)
+        elif status == "확인필요":
+            mark_fill(ws, rr, 1, REVIEW_FILL)
+
+    for c in [4, 5, 7]:
+        for r in range(2, ws.max_row + 1):
+            ws.cell(row=r, column=c).number_format = FMT_AMOUNT
+    for r in range(2, ws.max_row + 1):
+        ws.cell(row=r, column=6).number_format = FMT_PERCENT
+    finalize_sheet(ws, 1, len(headers), ws.max_row)
+    ws.column_dimensions["C"].width = 40
+    ws.column_dimensions["I"].width = 45
+    for r in range(2, ws.max_row + 1):
+        ws.cell(row=r, column=9).alignment = WRAP_TOP
+
+    return n_accept, n_override, n_nolist
+
+
 def main():
     rows = load_items()
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     build_message_sheet(wb, rows)
     build_list_sheet(wb, rows)
-    wb._sheets = [wb["매입단가_제시(초안)"], wb["제시단가_상세내역"]]
+    n_accept, n_override, n_nolist = build_full_offer_sheet(wb, rows)
+    wb._sheets = [wb["매입단가_제시(초안)"], wb["제시단가_상세내역"], wb["전체493종_매입단가_제시"]]
 
     out_path = OUTPUT_DIR / "16_대성_매입단가_제시.xlsx"
     wb.save(out_path)
@@ -188,6 +251,8 @@ def main():
     print("=== 16단계: 대성인포텍 매입단가 제시 목록 생성 완료 ===")
     print(f"표준 할인율 미적용(SFP): {n_sfp}건, 표기오류 추정(형제품목 대체): {n_err}건")
     print(f"현재 제시가 대비 인하 총액: {total_down:,.0f}원")
+    print(f"전체 493종 매입단가 제시: 대성 제시가 그대로 수용 {n_accept}건, 수정 제시 "
+          f"{n_override}건, 정가 정보 없음(그대로 수용) {n_nolist}건")
     print(f"생성 파일: {out_path}")
 
 
