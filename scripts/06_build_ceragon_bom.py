@@ -95,6 +95,33 @@ NEW_KCODE_BY_NAME = {
     "CER_Dhrtr- AC/DC CONV": "K9213033",
 }
 
+# 2026-09-15: 16번 파일(대성_매입단가_제시)에서 KT가 제시한 매입단가 42건을 대성이 수용했다
+# (돈현님: "협력사에서 단가 수용했습니다"). 원본 input 파일은 수정하지 않는 프로젝트 규칙에
+# 따라, 여기서 K코드 기준으로 '최종인하단가'만 협상 결과로 치환한다 - 다른 값(정가/수량/품명
+# 등)은 원본 그대로다. 40건은 KT 마진 확보를 위한 필요매입가(정가 x (1-마진율)) 역산값,
+# 2건(RFUC-CPLR-8, RFUC-TWIST Kit-6)은 원본 데이터 오류로 보고 형제 품목 실제단가를 그대로
+# 적용한 값(반올림). 출처: output/16_대성_매입단가_제시.xlsx '요청단가_상세내역' 시트.
+NEGOTIATED_PRICE_OVERRIDE = {
+    "K9197309": 44479, "K9197306": 40916, "K9197304": 24909,
+    "K9197334": 17104815, "K9178824": 13738236, "K9178823": 13738236,
+    "K9178822": 13738236, "K9178821": 13738236, "K9197333": 13390675,
+    "K9197167": 11421197, "K9178820": 10599209, "K9178819": 10599209,
+    "K9178818": 10599209, "K9178817": 10599209, "K9197332": 8475967,
+    "K9178816": 8372613, "K9178815": 8372613, "K9178814": 8372613,
+    "K9178813": 8372613, "K9197331": 6971419, "K9178812": 6346080,
+    "K9178811": 6346080, "K9178810": 6346080, "K9178809": 6346080,
+    "K9178830": 5182894, "K9178829": 5182894, "K9178828": 5182894,
+    "K9178878": 5182894, "K9178808": 4771614, "K9178807": 4771614,
+    "K9178806": 4771614, "K9178805": 4771614, "K9178804": 3389927,
+    "K9178803": 3389927, "K9178802": 3389927, "K9178800": 3389927,
+    "K9178877": 2933649, "K9178876": 2933649, "K9178875": 2933649,
+    "K9178690": 202880, "K9178851": 467968, "K9178856": 105110,
+}
+
+
+def negotiated_price(kcode, raw_price):
+    return NEGOTIATED_PRICE_OVERRIDE.get(kcode, raw_price)
+
 
 def read_sheet_rows(ws, last_row):
     """행 번호(row)를 키로 사용한다. 'K코드' 열에 실제 K코드 대신 '신규코드' 같은 placeholder
@@ -138,7 +165,7 @@ def build_bom_long(ws_discount, ws_old, freq_label, item_status):
     for info in disc_rows.values():
         kcode = info["K코드"]
         r = info["row"]
-        discount_price = ws_discount.cell(row=r, column=8).value or 0
+        discount_price = negotiated_price(kcode, ws_discount.cell(row=r, column=8).value or 0)
         old_info = old_by_kcode.get(kcode) if info["K코드_실제여부"] else None
         for cfg_raw, sd, col_a, col_b in CONFIG_COLS_DISCOUNT:
             qty_a = ws_discount.cell(row=r, column=col_a).value or 0
@@ -200,7 +227,7 @@ def main():
                 continue
             seen[kcode] = True
             status = item_status.get(kcode, "확인필요") if info["K코드_실제여부"] else "신규코드(코드 미부여)"
-            discount_price = wb_src[disc_sheet].cell(row=info["row"], column=8).value or 0
+            discount_price = negotiated_price(kcode, wb_src[disc_sheet].cell(row=info["row"], column=8).value or 0)
             ws1.append([kcode, info["품명"], info["설명"], info["단위"], info["단가"] or None,
                         discount_price or None, None, status])
             r = ws1.max_row
