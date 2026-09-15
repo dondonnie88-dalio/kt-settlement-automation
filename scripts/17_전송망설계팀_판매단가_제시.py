@@ -29,6 +29,14 @@
 16번 '전체493종_매입단가_제시' 시트(품목상태/K코드/품명/정가/... 구조)를 그대로
 재사용하되, 대성向 매입단가/할인율/조정구분처럼 협상·원가 관련 열은 빼고 판매단가만
 채운다 - 전송망설계팀에는 원가 구조를 노출하지 않기로 한 방침은 유지.
+
+추가(2026-09-15, 4차): "신규품목 하나도 안 깎고 합의했는데 실수한 거 아닐까요?" 질문에서
+출발해, 정가가 없어 42건 협상 대상에서 애초에 빠졌던 19개 신규 SW패키지 품목을
+재검토함. 카탈로그 내 실제 SD/Non_SD 짝(ICC/ICB, 8쌍)은 전부 SD가 31~39% 비싼데,
+이번 8/11GHz 딜에 포함된 4개 품목(6+0/8+0의 SD·Non_SD 페어: K9213027/028/029/030)은
+SD가 오히려 더 싸다 - 방향이 뒤집힘. 대성에 확인 요청 중(18번 파일). 확인 전까지
+이 4개 품목만 '확인 중(잠정치)'로 표시하고, 나머지 489개는 그대로 전달한다 - 전체를
+늦추기엔 근거가 이 4개에 국한된다.
 """
 import sys
 from pathlib import Path
@@ -42,6 +50,15 @@ BASE_DIR = Path("/home/user/kt-settlement-automation")
 OUTPUT_DIR = BASE_DIR / "output"
 SRC_06 = OUTPUT_DIR / "06_Ceragon_구성방식별_BoM_정리.xlsx"
 SRC_15 = OUTPUT_DIR / "15_매입판매가_제시안.xlsx"
+
+# 2026-09-15: 대성에 SD/Non_SD 스케일링 확인 요청 중인 품목(18번 파일 참고). 확인 전까지
+# 전송망설계팀에는 '확인 중(잠정치)'로 표시한다.
+PENDING_CONFIRM = {
+    "K9213027": "SD가 Non_SD보다 싼 역전 현상 확인 중(대성 회신 대기, 18번 파일 참고)",
+    "K9213028": "SD가 Non_SD보다 싼 역전 현상 확인 중(대성 회신 대기, 18번 파일 참고)",
+    "K9213029": "SD가 Non_SD보다 싼 역전 현상 확인 중(대성 회신 대기, 18번 파일 참고)",
+    "K9213030": "SD가 Non_SD보다 싼 역전 현상 확인 중(대성 회신 대기, 18번 파일 참고)",
+}
 
 
 def load_item_status():
@@ -67,6 +84,7 @@ def load_item_prices():
             "품목상태": status.get(kcode, "확인필요"), "K코드": kcode,
             "품명": r[i["품명"]].strip(),
             "판매단가": round(r[i["고객 제시단가(최초견적, 버퍼 3%p)"]]),
+            "비고": PENDING_CONFIRM.get(kcode, ""),
         })
     rows.sort(key=lambda x: x["K코드"])
     return rows
@@ -84,6 +102,9 @@ def build_message_sheet(wb, rows):
         "기준입니다.\n\n"
         "위 단가는 당사 표준 마진 정책(장비군별 2~5%)을 반영해 산정하였습니다. "
         "산정 근거가 필요하시면 말씀해 주시면 상세 자료를 공유드리겠습니다.\n\n"
+        "다만 4개 품목(K9213027~030, 8/11GHz 6+0/8+0 구성 SW패키지)은 공급사 측 "
+        "가격 구조를 확인 중이라 잠정치입니다 - 확인 완료 후 갱신된 단가로 다시 "
+        "안내드리겠습니다.\n\n"
         "검토 후 문의사항 있으시면 편하게 연락 주세요.\n\n"
         "감사합니다.\n"
         "KT commerce 이돈현 드림"
@@ -108,6 +129,10 @@ def build_message_sheet(wb, rows):
                 "전체·K코드 정렬 구조를 재사용하되, 대성向 매입단가/할인율/조정구분 "
                 "같은 원가·협상 관련 열은 빼고 판매단가만 담았다 - 전송망설계팀에는 "
                 "원가 구조를 노출하지 않는다는 방침 유지."),
+        ("확인 중 4개 품목(내부용)", "K9213027~030(8/11GHz 6+0/8+0 SD·Non_SD SW패키지)는 "
+                "SD가 Non_SD보다 싼 역전 현상이 있어 대성에 확인 요청 중(18번 파일). 이 "
+                "4개만 '확인 중(잠정치)'로 표시하고 나머지 489개는 그대로 전달 - 근거가 "
+                "이 4개에 국한돼 전체를 늦출 필요는 없다는 판단."),
         ("주의", "이 초안은 자동 생성된 것이니 보내시기 전에 실제 상황(호칭, 첨부 형식, "
               "일정 등)에 맞게 다듬어서 사용하시기 바랍니다."),
     ]
@@ -121,17 +146,21 @@ def build_message_sheet(wb, rows):
 
 def build_table_sheet(wb, rows):
     ws = wb.create_sheet("전체493종_판매단가_제시")
-    headers = ["품목상태", "K코드", "품명", "판매단가(EA)"]
+    headers = ["품목상태", "K코드", "품명", "판매단가(EA)", "비고"]
     ws.append(headers)
     for r in rows:
         rr = ws.max_row + 1
-        ws.append([r["품목상태"], r["K코드"], r["품명"], r["판매단가"]])
+        ws.append([r["품목상태"], r["K코드"], r["품명"], r["판매단가"], r["비고"]])
         if r["품목상태"] == "확인필요":
             mark_fill(ws, rr, 1, REVIEW_FILL)
+        if r["비고"]:
+            mark_fill(ws, rr, 4, REVIEW_FILL)
+            mark_fill(ws, rr, 5, REVIEW_FILL)
     for r in range(2, ws.max_row + 1):
         ws.cell(row=r, column=4).number_format = FMT_AMOUNT
     finalize_sheet(ws, 1, len(headers), ws.max_row)
     ws.column_dimensions["C"].width = 40
+    ws.column_dimensions["E"].width = 50
 
 
 def main():
