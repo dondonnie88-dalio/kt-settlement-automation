@@ -131,6 +131,20 @@ def capped_sale(buy, rate, list_price):
     return sale
 
 
+def capped_anchor(sale, list_price):
+    """돈현님 지적(2026-09-15): 정가상한에 걸려 목표가(sale)가 이미 정가 근처까지 차 있는
+    품목은, 그 위에 협상 버퍼(ANCHOR_BUFFER)까지 얹으면 결과값이 다시 정가를 넘어버린다
+    (전송망설계팀向 K코드별 단가표에서 다수 품목이 '신규단가 > 기존단가'로 나타남 - 실제
+    발견 사례). capped_sale과 같은 원칙(공급사 정가보다 비싸게 제시할 수 없다)을 버퍼
+    적용 이후 최종값에도 동일하게 적용해 재상한을 건다."""
+    if not sale:
+        return 0
+    anchor = sale * (1 + ANCHOR_BUFFER)
+    if list_price and list_price > 0:
+        anchor = min(anchor, list_price)
+    return anchor
+
+
 def verify_aviat_margin_structure():
     """01번 파일 전수 검산 - 이 파일의 핵심 전제(마진 구조)를 재현 가능하게 남긴다."""
     wb = openpyxl.load_workbook(SRC_AVIAT_213, data_only=True)
@@ -284,6 +298,20 @@ def build_guide_sheet(wb, n_total, n_exact):
                               f" 있다는 지적에 따라 3%p로 낮췄다 - 그대로 수락돼도 '표준 마진 범위"
                               f" 내 약간의 여유'로 보일 정도만 남긴 것이다. 버퍼 크기는 "
                               f"ANCHOR_BUFFER 상수 하나만 바꾸면 전체 시트에 일괄 반영된다."),
+        ("버퍼 재상한 버그 수정(2026-09-15) - 중요한 버그 수정", "돈현님이 전송망설계팀向 "
+                              "K코드별 단가표에서 다수 품목의 '신규(판매)단가'가 '기존단가(정가)'"
+                              "보다 높다는 걸 발견했다. 원인: 정가상한에 걸려 목표가가 이미 정가에 "
+                              "근접한 품목은, 그 위에 버퍼(+3%p)를 얹는 순간 결과값이 다시 정가를 "
+                              "넘어버렸다 - capped_sale()은 목표가 단계에서만 정가 상한을 걸고, "
+                              "버퍼를 곱한 뒤에는 재확인을 하지 않았던 게 원인. capped_anchor() "
+                              "함수를 추가해 버퍼 적용 후 최종값도 다시 정가로 상한을 걸도록 "
+                              "고쳤다(품목별로 먼저 상한을 걸고 카테고리 합계를 내는 방식은 기존 "
+                              "capped_sale과 동일). 이 경우로 새로 상한이 걸린 품목은 '가격 이상 "
+                              "여부' 열에 '버퍼상한 적용'으로 표시했다 - 일부러 '정가상한'이라는 "
+                              "문구를 쓰지 않았는데, 16번이 '정가상한'이 포함된 문자열을 대성에 "
+                              "매입가 재협상을 요청할 대상으로 간주해 필터링하기 때문이다(이 항목은"
+                              " 애초에 목표가 자체는 정가 이내라 대성에 요청할 이유가 없는, 순수하게"
+                              " KT 내부 버퍼 계산의 문제)."),
     ]
     for k, v in guide:
         ws.append([k, v])
@@ -318,16 +346,23 @@ def build_band_sheet(wb, band, cfg):
         rate = margin_rate(None if cat == "기타" else cat)
         row_vals = [label]
         capped_any = False
+        anchor_capped_any = False
         for sd in ["Non_SD", "SD"]:
             items = totals[sd].get(cat, [])
             buy = sum(r["매입액"] for r in items)
             # 품목별로 '판매가가 대성 정가(기존금액)를 넘지 않도록' 상한을 걸고 나서 합산한다
             # (카테고리 합계에만 상한을 걸면 품목별 초과가 합계 안에 묻혀 안 보일 수 있음).
+            # 버퍼(anchor)도 같은 이유로 품목별로 먼저 상한을 걸고 합산한다(2026-09-15 수정
+            # 전에는 카테고리 합계 sale에 버퍼를 곱해, 이미 정가상한에 걸린 품목이 버퍼
+            # 때문에 다시 정가를 초과하는 문제가 있었다).
             sale = sum(capped_sale(r["매입액"], rate, r["기존금액"]) for r in items)
+            anchor = sum(capped_anchor(capped_sale(r["매입액"], rate, r["기존금액"]), r["기존금액"]) for r in items)
             if any(r["매입액"] and r["매입액"] / (1 - rate) > (r["기존금액"] or float("inf")) for r in items):
                 capped_any = True
+            if any(capped_sale(r["매입액"], rate, r["기존금액"]) * (1 + ANCHOR_BUFFER) >
+                   (r["기존금액"] or float("inf")) for r in items):
+                anchor_capped_any = True
             margin_amt = sale - buy
-            anchor = sale * (1 + ANCHOR_BUFFER) if sale else 0
             row_vals += [buy or None, rate, sale or None, margin_amt or None, anchor or None]
             grand[f"{sd}_매입"] += buy
             grand[f"{sd}_판매"] += sale
@@ -338,6 +373,9 @@ def build_band_sheet(wb, band, cfg):
         if capped_any:
             mark_fill(ws, ws.max_row, 4, ERROR_FILL)
             mark_fill(ws, ws.max_row, 9, ERROR_FILL)
+        if anchor_capped_any:
+            mark_fill(ws, ws.max_row, 6, ERROR_FILL)
+            mark_fill(ws, ws.max_row, 11, ERROR_FILL)
 
     r = ws.max_row + 1
     ws.append(["합계", grand["Non_SD_매입"] or None, None, grand["Non_SD_판매"] or None,
@@ -407,13 +445,20 @@ def build_full_catalog_sheet(wb):
         # 수는 없으므로 기존단가를 상한으로 둔다.
         raw_sale = buy / (1 - rate) if buy else 0
         sale = capped_sale(buy, rate, list_price)
+        raw_anchor = sale * (1 + ANCHOR_BUFFER) if sale else 0
+        anchor = capped_anchor(sale, list_price)
         if list_price and buy > list_price:
             anomaly = "데이터 이상치(할인 후 가격이 정가보다 높음 - 공급사 확인 필요)"
         elif list_price and raw_sale > list_price:
             anomaly = "정가상한 적용(대성 할인율<마진율이라 정가로 상한)"
+        elif list_price and raw_anchor > list_price:
+            # 주의: 이 문자열에 '정가상한'을 그대로 넣으면 16번의 "'정가상한' in flag"
+            # 부분일치 필터가 이 항목까지 '매입가 재협상 필요' 대상으로 잘못 집어간다
+            # (raw_sale은 이미 정가 이내라 대성에 요청할 게 없는 순수 버퍼 이슈인데도).
+            # 그래서 일부러 다른 표현(버퍼상한)을 쓴다.
+            anomaly = "버퍼상한 적용(목표가+버퍼가 정가 초과해 정가로 재상한, 대성과 무관)"
         else:
             anomaly = ""
-        anchor = sale * (1 + ANCHOR_BUFFER) if sale else 0
         rows.append((kcode, name, buy, rate, sale, anchor, label, scope, conf, anomaly))
 
     conf_order = {"확인됨": 0, "패턴 매칭 추정": 1}
@@ -421,7 +466,7 @@ def build_full_catalog_sheet(wb):
                    "비무선 제품(확인 필요)": 2, "타대역/구세대 추정(계약범위 확인 필요)": 3}
     rows.sort(key=lambda r: (conf_order.get(r[8], 9), scope_order.get(r[7], 9), r[1]))
 
-    n_confirmed = n_pattern = n_capped = n_anomaly = 0
+    n_confirmed = n_pattern = n_capped = n_anomaly = n_buffer_capped = 0
     for kcode, name, buy, rate, sale, anchor, label, scope, conf, anomaly in rows:
         r = ws.max_row + 1
         ws.append([kcode, name, buy or None, rate, sale or None, anchor or None, label, scope, conf, anomaly])
@@ -440,6 +485,10 @@ def build_full_catalog_sheet(wb):
             mark_fill(ws, r, 10, REVIEW_FILL)
             mark_fill(ws, r, 5, REVIEW_FILL)
             n_capped += 1
+        elif anomaly.startswith("버퍼상한"):
+            mark_fill(ws, r, 10, REVIEW_FILL)
+            mark_fill(ws, r, 6, REVIEW_FILL)
+            n_buffer_capped += 1
 
     for c in [3, 5, 6]:
         for r in range(2, ws.max_row + 1):
@@ -448,7 +497,7 @@ def build_full_catalog_sheet(wb):
         ws.cell(row=r, column=4).number_format = FMT_PERCENT
     finalize_sheet(ws, 1, len(headers), ws.max_row)
     ws.column_dimensions["B"].width = 45
-    return n_confirmed, n_pattern, len(rows), n_capped, n_anomaly
+    return n_confirmed, n_pattern, len(rows), n_capped, n_anomaly, n_buffer_capped
 
 
 def main():
@@ -463,7 +512,7 @@ def main():
         results.append(build_band_sheet(wb, band, cfg))
 
     build_summary_sheet(wb, results)
-    n_confirmed, n_pattern, n_catalog, n_capped, n_anomaly = build_full_catalog_sheet(wb)
+    n_confirmed, n_pattern, n_catalog, n_capped, n_anomaly, n_buffer_capped = build_full_catalog_sheet(wb)
 
     sheet_order = (["안내", "마진구조_검증(01번 전수)"]
                    + [f"{b}_{c}_제시안" for b, c in BAND_CONFIGS]
@@ -487,6 +536,8 @@ def main():
           f"{n_pattern}건 - '전체카탈로그_단가제시안' 시트 참조.")
     print(f"※ 대성 할인율<마진율이라 정가상한을 적용한 품목 {n_capped}건, 할인 후 가격이 오히려 "
           f"정가보다 높은 데이터 이상치 {n_anomaly}건 - 각각 REVIEW/ERROR 색상으로 표시했습니다.")
+    print(f"※ 목표가는 정가 이내였지만 버퍼(+{ANCHOR_BUFFER*100:.0f}%p) 적용 후 정가를 넘어 "
+          f"재상한을 건 품목 {n_buffer_capped}건(2026-09-15 수정, 대성과 무관한 KT 내부 버퍼 이슈).")
 
 
 if __name__ == "__main__":
